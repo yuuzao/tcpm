@@ -1,18 +1,16 @@
-use etherparse::TcpHeader;
-use std::collections::HashMap;
-use std::fs::OpenOptions;
-use std::io;
-
-use log::{debug, error, info};
-
 use crate::util;
-// Transmission Control Block,or TCB, see RFC 793 page 19
-pub struct TransmissionControlBlock {
+use log::{debug, error, info};
+use std::{collections::VecDeque, default, io, net::Incoming};
+
+pub struct TCB {
     state: State,
     send: SendSequenceSpace,
     recv: RecvSequenceSpace,
     ip_header: etherparse::Ipv4Header,
     tcp_header: etherparse::TcpHeader,
+
+    pub(crate) incoming: VecDeque<u8>,
+    pub(crate) unacked: VecDeque<u8>,
 }
 
 enum State {
@@ -62,8 +60,9 @@ impl RecvSequenceSpace {
     }
 }
 
-impl TransmissionControlBlock {
-    pub fn establish(
+impl TCB {
+    /// listen on a port, return the
+    pub fn new(
         nic: &mut tun_tap::Iface,
         ip_header: etherparse::Ipv4HeaderSlice,
         tcp_header: etherparse::TcpHeaderSlice,
@@ -105,6 +104,8 @@ impl TransmissionControlBlock {
                 iss,
                 1024,
             ),
+            incoming: Default::default(),
+            unacked: Default::default(),
         };
         tcb.tcp_header.syn = true;
         tcb.tcp_header.ack = true;

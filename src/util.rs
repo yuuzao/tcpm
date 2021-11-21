@@ -1,8 +1,12 @@
 use simplelog::*;
 
-pub fn logging() {
+pub fn logging(level: &str) {
+    let level = match level {
+        "info" => LevelFilter::Info,
+        _ => LevelFilter::Debug,
+    };
     TermLogger::init(
-        LevelFilter::Info,
+        level,
         Config::default(),
         TerminalMode::Mixed,
         ColorChoice::Auto,
