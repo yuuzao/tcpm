@@ -125,10 +125,11 @@ fn packet_loop(mut nic: tun_tap::Iface, acm: Acm) -> io::Result<()> {
                                 if let Some(pending) = cm.pending.get_mut(&my_port) {
                                     debug!("port is on, now trying to establish connection");
                                     if let Some(c) = TCB::new(&mut nic, ip_header, tcp_header)? {
+                                        debug!("connection established");
                                         con.insert(c);
                                         pending.push_back(sp);
                                         drop(cm);
-                                        acm.new_connnections.notify_all();
+                                        acm.estab_notifier.notify_all();
                                     }
                                 } else {
                                     debug!("Port is off, ignoring...")
