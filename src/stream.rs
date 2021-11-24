@@ -1,12 +1,11 @@
 use crate::protocol;
-use log::debug;
+use log::{debug, info};
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
 use std::io;
 use std::io::{Read, Write};
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Condvar, Mutex};
-use std::thread;
 
 pub type Acm = Arc<AtomicallyConnectionManager>;
 #[derive(Default)]
@@ -104,15 +103,61 @@ impl Read for TcpStream {
     }
 }
 impl Write for TcpStream {
+    /// first we get the lock of ConnectionManager
+    /// and we should check whether the TCB still exists.
+    /// then write the buffer into unacked
+    /// note that buffer size may exceed the unacked limit. So there may be several
+    /// TCP segments for this buffer.
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        Ok(1234)
+        let mut m = self.m.manager.lock().unwrap();
+        let c = m.connections.get_mut(&self.socketpair).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "Stream was terminated unexpectedly",
+            )
+        })?;
+        if c.unacked.len() >= 1024 {
+            // TODO: block
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "too many bytes buffered",
+            ));
+        };
+        let write_len = std::cmp::min(buf.len(), 1024 - c.unacked.len());
+        c.unacked.extend(buf[..write_len].iter());
+        info!("Stream::Write: c.unacked {:?} bytes", c.unacked.len());
+
+        Ok(write_len)
     }
     fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+        let mut m = self.m.manager.lock().unwrap();
+        let c = m.connections.get_mut(&self.socketpair).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "Connection was terminated unexpectedly",
+            )
+        })?;
+
+        if c.unacked.is_empty() {
+            Ok(())
+        } else {
+            // TODO: block
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "too many bytes buffered",
+            ));
+        }
     }
 }
 impl TcpStream {
     pub fn shutdown<T>(&self, t: T) -> io::Result<()> {
-        Ok(())
+        let mut m = self.m.manager.lock().unwrap();
+        let c = m.connections.get_mut(&self.socketpair).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "Connection was terminated unexpectedly",
+            )
+        })?;
+        c.close()
     }
 }

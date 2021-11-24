@@ -2,6 +2,7 @@ use crate::protocol::TCB;
 use crate::stream::TcpListener;
 use crate::stream::{Acm, SocketPair};
 use log::{debug, error, info};
+use nix;
 use std::collections::{hash_map::Entry, HashMap, VecDeque};
 use std::io;
 use std::thread;
@@ -62,14 +63,50 @@ impl Interface {
     }
 }
 
+fn send(mut nic: tun_tap::Iface, acm: Acm) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let mut pfd = [nix::poll::PollFd::new(
+        nic.as_raw_fd(),
+        nix::poll::PollFlags::POLLIN,
+    )];
+    let n = nix::poll::poll(&mut pfd[..], 10).unwrap();
+    assert_ne!(n, -1);
+    if n == 0 {
+        let mut cm = acm.manager.lock().unwrap();
+        for c in cm.connections.values_mut() {
+            c.on_tick(&mut nic)?;
+        }
+    }
+    assert_eq!(n, 1);
+    Ok(())
+}
+
 /// This function is initialized by the new() method of Interface. It will
 /// never ends and watches the incoming tcp packets and then notify the
 /// related threads to process on.
 // TODO: ih.notify
 fn packet_loop(mut nic: tun_tap::Iface, acm: Acm) -> io::Result<()> {
+    info!("packet loop starts");
+
     let mut buf = [0u8; 1500];
 
     loop {
+        use std::os::unix::io::AsRawFd;
+        let mut pfd = [nix::poll::PollFd::new(
+            nic.as_raw_fd(),
+            nix::poll::PollFlags::POLLIN,
+        )];
+        let n = nix::poll::poll(&mut pfd[..], 10).unwrap();
+        assert_ne!(n, -1);
+        if n == 0 {
+            let mut cm = acm.manager.lock().unwrap();
+            for c in cm.connections.values_mut() {
+                c.on_tick(&mut nic).unwrap();
+            }
+            continue;
+        }
+        assert_eq!(n, 1);
+
         let buf_len = nic.recv(&mut buf[..])?;
         // let's ignore non-IP packets
         if !matches!(
