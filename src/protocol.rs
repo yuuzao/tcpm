@@ -332,7 +332,7 @@ impl TCB {
                 );
                 self.incoming.extend(&data[unread_data_at..]);
                 self.recv.nxt = seqn.wrapping_add(data_len);
-                // self.write(nic, self.send.nxt)?;
+                self.write(nic, &[])?;
             }
         }
 
