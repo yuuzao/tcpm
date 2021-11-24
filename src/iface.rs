@@ -13,7 +13,7 @@ pub struct Interface {
 
 impl Interface {
     pub fn new(ifacename: &str) -> io::Result<Self> {
-        info!("created new interface");
+        debug!("Interface: created new interface");
         let nic = tun_tap::Iface::without_packet_info(ifacename, tun_tap::Mode::Tun)
             .expect("Failed to create interface");
 
@@ -78,7 +78,7 @@ fn packet_loop(mut nic: tun_tap::Iface, acm: Acm) -> io::Result<()> {
                 .ip,
             Some(etherparse::InternetSlice::Ipv4(_))
         ) {
-            debug!("Not a Ipv4 packet");
+            // debug!("Interface: not a Ipv4 packet");
             continue;
         }
 
@@ -87,29 +87,32 @@ fn packet_loop(mut nic: tun_tap::Iface, acm: Acm) -> io::Result<()> {
                 // let's ignore non-TCP packets
                 //LINK https://en.wikipedia.org/wiki/List_of_IP_protocol_numbers
                 if ip_header.protocol() != 6 {
-                    debug!("Protocol is {}, not a TCP packet...", ip_header.protocol());
+                    // debug!(
+                    //     "Interface: not a TCP packet, protocol number is {}",
+                    //     ip_header.protocol()
+                    // );
                     continue;
                 }
 
-                info!("Got a TCP packet");
-                debug!("Ipv4 Packet content: {:02x?}", &buf[..buf_len]);
+                debug!(
+                    "Interface: got a TCP packet, Ipv4 Packet content length: {}",
+                    buf_len
+                );
 
                 // ihl in ip header stands for the ip header's length, note the unit is 4bytes.
                 match etherparse::TcpHeaderSlice::from_slice(
                     &buf[ip_header.ihl() as usize * 4..buf_len],
                 ) {
                     Ok(tcp_header) => {
-                        debug!("TCP header content: {:02x?}", &tcp_header);
-
                         // assign four vars for less confusing.
-                        // TODO: delete these vars to reduce memory allocation.
-                        let client_addr = ip_header.source_addr();
-                        let client_port = tcp_header.source_port();
-                        let my_addr = ip_header.destination_addr();
-                        let my_port = tcp_header.destination_port();
+                        // FIXME: delete these vars to reduce memory allocation.
+                        let remote_addr = ip_header.source_addr();
+                        let remote_port = tcp_header.source_port();
+                        let local_addr = ip_header.destination_addr();
+                        let local_port = tcp_header.destination_port();
                         let sp = SocketPair {
-                            src: (client_addr, client_port),
-                            dst: (my_addr, my_port),
+                            src: (remote_addr, remote_port),
+                            dst: (local_addr, local_port),
                         };
 
                         let mut cm_guard = acm
@@ -121,33 +124,35 @@ fn packet_loop(mut nic: tun_tap::Iface, acm: Acm) -> io::Result<()> {
                         match cm.connections.entry(sp) {
                             //new connection comes as vacant
                             Entry::Vacant(con) => {
-                                info!("Got a packet from a new client");
-                                if let Some(pending) = cm.pending.get_mut(&my_port) {
-                                    debug!("port is on, now trying to establish connection");
+                                debug!("Interface: Got a packet from a new client");
+                                if let Some(pending) = cm.pending.get_mut(&local_port) {
+                                    debug!(
+                                        "Listener: port is on, now trying to establish connection"
+                                    );
                                     if let Some(c) = TCB::new(&mut nic, ip_header, tcp_header)? {
-                                        debug!("connection established");
+                                        debug!("Listener: connection established");
                                         con.insert(c);
                                         pending.push_back(sp);
                                         drop(cm);
                                         acm.estab_notifier.notify_all();
                                     }
                                 } else {
-                                    debug!("Port is off, ignoring...")
+                                    debug!("Listener: Port is off, ignoring...")
                                 }
                             }
 
                             // existed connections comes as occupied
                             // TODO: complete this
                             Entry::Occupied(mut con) => {
-                                debug!("Got a packet from known a connection");
+                                debug!("Interface: got a packet from known a connection");
 
+                                let data_start = ip_header.ihl() as usize * 4
+                                    + tcp_header.slice().len() as usize;
                                 con.get_mut()
-                                    .unpack(
-                                        &mut nic,
-                                        tcp_header,
-                                        &buf[ip_header.total_len() as usize..buf_len],
-                                    )
+                                    .unpack(&mut nic, tcp_header, &buf[data_start..buf_len])
                                     .expect("unpacking TCP packet failed");
+                                drop(cm);
+                                acm.reading_notifier.notify_all();
                             }
                         }
                     }

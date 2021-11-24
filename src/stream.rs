@@ -1,11 +1,12 @@
 use crate::protocol;
-use log::{debug, info};
+use log::debug;
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
 use std::io;
 use std::io::{Read, Write};
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
 
 pub type Acm = Arc<AtomicallyConnectionManager>;
 #[derive(Default)]
@@ -42,7 +43,7 @@ impl TcpListener {
                 .expect("port closed while listener still active")
                 .pop_front()
             {
-                debug!("Let's Streaming!!!");
+                debug!("Listener: Let's Streaming!!!");
                 return Ok(TcpStream {
                     socketpair: sp,
                     m: self.m.clone(),
@@ -52,6 +53,7 @@ impl TcpListener {
     }
 }
 
+#[derive(Clone)]
 pub struct TcpStream {
     socketpair: SocketPair,
     m: Arc<AtomicallyConnectionManager>,
@@ -66,6 +68,7 @@ impl Read for TcpStream {
             .expect("failed to get lock in reading");
         loop {
             cm = self.m.reading_notifier.wait(cm).unwrap();
+            debug!("Stream::Read: Reader awaked");
 
             let c = cm.connections.get_mut(&self.socketpair).ok_or_else(|| {
                 io::Error::new(
@@ -73,16 +76,27 @@ impl Read for TcpStream {
                     "stream terminated unexpectedly",
                 )
             })?;
+
+            if c.is_recv_closed() && c.incoming.is_empty() {
+                debug!("Stream::Read: Recv closed and incoming empty, ending...");
+                return Ok(0);
+            }
+
+            debug!("STREAM::READ: incoming empty? {}", c.incoming.is_empty());
+
             if !c.incoming.is_empty() {
+                debug!("Stream::Read: start reading");
+                //TODO: figure out vecdeque drain
                 let mut nread = 0;
                 let (head, tail) = c.incoming.as_slices();
-                let hread = std::cmp::min(buf.len(), head.len());
-                buf[..hread].copy_from_slice(&head[..hread]);
-                nread += hread;
+                let head_size = std::cmp::min(buf.len(), head.len());
+                buf[..head_size].copy_from_slice(&head[..head_size]);
+                nread += head_size;
 
-                let tread = std::cmp::min(buf.len() - nread, tail.len());
-                buf[hread..(hread + tread)].copy_from_slice(&tail[..tread]);
-                nread += tread;
+                let tail_size = std::cmp::min(buf.len() - nread, tail.len());
+                buf[nread..(nread + tail_size)].copy_from_slice(&tail[..tail_size]);
+                nread += tail_size;
+                //remember drop
                 drop(c.incoming.drain(..nread));
                 return Ok(nread);
             }

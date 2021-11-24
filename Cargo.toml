@@ -1,5 +1,5 @@
 [package]
-name = "mytcp"
+name = "tcpm"
 version = "0.1.0"
 authors = ["yuuzao <w@tcp.cat>"]
 edition = "2021"
@@ -14,4 +14,7 @@ log = "0.4.14"
 simplelog = "0.11.0"
 
 [[bin]]
-name = "mytcp"
+name = "tcpm"
+
+[lib]
+name = "tcpm"

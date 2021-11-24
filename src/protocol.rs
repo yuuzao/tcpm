@@ -1,6 +1,7 @@
 use crate::util;
-use log::{debug, error, info};
-use std::{collections::VecDeque, default, io, net::Incoming};
+use log::debug;
+use std::collections::VecDeque;
+use std::io;
 
 pub struct TCB {
     state: State,
@@ -19,6 +20,13 @@ enum State {
     FinWait1,
     FinWait2,
     TimeWait,
+}
+enum TcpControl {
+    None,
+    RST,
+    FIN,
+    ACK,
+    SYN,
 }
 
 struct SendSequenceSpace {
@@ -67,7 +75,7 @@ impl TCB {
         ip_header: etherparse::Ipv4HeaderSlice,
         tcp_header: etherparse::TcpHeaderSlice,
     ) -> io::Result<Option<Self>> {
-        let mut buf = [0u8; 1500];
+        let buf = [0u8; 1500];
         if !tcp_header.syn() {
             return Ok(None);
         }
@@ -110,7 +118,7 @@ impl TCB {
         tcb.tcp_header.syn = true;
         tcb.tcp_header.ack = true;
 
-        tcb.write(nic, &[]);
+        tcb.write(nic, &[]).unwrap();
 
         Ok(Some(tcb))
     }
@@ -119,7 +127,10 @@ impl TCB {
         let mut buf = [0u8; 1500];
         self.tcp_header.sequence_number = self.send.nxt;
         self.tcp_header.acknowledgment_number = self.recv.nxt;
-        info!("tcp header: {:?}", self.tcp_header);
+        debug!(
+            "TCB::new: tcp header length: {:?}",
+            self.tcp_header.header_len()
+        );
 
         // the ip packet to be sent should not exceeds the MTU.
         let data_size = std::cmp::min(
@@ -179,7 +190,10 @@ impl TCB {
             self.tcp_header.fin = false;
         }
 
-        info!("sending: {:02x?}", &buf[..buf.len() - unwritten]);
+        debug!(
+            "TCB::write: writing data with length: {:02x?}",
+            buf.len() - unwritten
+        );
         nic.send(&buf[..buf.len() - unwritten])
             .expect("nic send failed");
         Ok(payload_bytes)
@@ -195,7 +209,9 @@ impl TCB {
         // first, check if the sequence numbers are valid.
         // see RFC 793 page 24, it is complicated.
 
-        let mut segment_len = data.len() as u32; //check if segment is zero.
+        debug!("TCB::unpack: data content length: {}", &data.len());
+
+        let mut data_len = data.len() as u32; //check if segment is zero.
         let seqn = tcp_header.sequence_number();
 
         // then, figure out what is this packet used for. SYN, FIN or normal.
@@ -203,15 +219,15 @@ impl TCB {
             // After that, the connection is established.
             // we need to send ACK later for the third handshake.
             // After that, the connection is established.
-            segment_len += 1;
+            data_len += 1;
         }
         if tcp_header.syn() {
-            segment_len += 1;
+            data_len += 1;
         }
 
         // RFC 793 page 25, comparisons for sequence number
         let wend = self.recv.nxt.wrapping_add(self.recv.wnd as u32);
-        let acceptable = if segment_len == 0 {
+        let acceptable = if data_len == 0 {
             // segment is zero, see the comparisons in RFC 793 page 24
             if self.recv.wnd == 0 {
                 if seqn != self.recv.nxt {
@@ -231,7 +247,7 @@ impl TCB {
             } else if !util::is_between_wrapped(self.recv.nxt.wrapping_sub(1), seqn, wend)
                 && !util::is_between_wrapped(
                     self.recv.nxt.wrapping_sub(1),
-                    seqn.wrapping_add(segment_len - 1),
+                    seqn.wrapping_add(data_len - 1),
                     wend,
                 )
             {
@@ -242,14 +258,13 @@ impl TCB {
         };
 
         if !acceptable {
-            error!("Packet not acceptable");
+            debug!("TCB::unpack: Packet not acceptable");
             self.write(nic, &[]).expect("TCB write failed");
             return Ok(());
         }
 
-        self.recv.nxt = seqn.wrapping_add(segment_len);
         if !tcp_header.ack() {
-            info!("Packet does not have a ACK bit");
+            debug!("TCB::unpack: Packet does not have a ACK bit");
             return Ok(());
         }
         let ackn = tcp_header.acknowledgment_number();
@@ -266,20 +281,8 @@ impl TCB {
         }
 
         if let State::Estab | State::FinWait1 | State::FinWait2 = self.state {
-            // RFC 793 page 69, SEGMENT ARRIVES for states above
+            // RFC 793 page 69, "SEGMENT ARRIVES" handling for states above
             // first check sequence number
-            if !util::is_between_wrapped(self.send.una, ackn, self.send.nxt.wrapping_add(1)) {
-                info!("Invalid sequence number");
-                return Ok(());
-            }
-            self.send.una = ackn;
-            assert!(data.is_empty());
-            if let State::Estab = self.state {
-                // suppose we end here
-                self.tcp_header.fin = true;
-                self.write(nic, &[]);
-                self.state = State::FinWait1;
-            }
             // Wont' fix: second check RST
             // Wont' fix: third check security and precedence
             // Not here: fourth, check the SYN bit
@@ -287,19 +290,56 @@ impl TCB {
             // sixth, check the URG bit
             // seventh, process the segment text
             // eighth, check the FIN bit
+
+            if !util::is_between_wrapped(self.send.una, ackn, self.send.nxt.wrapping_add(1)) {
+                debug!("TCB::unpack: Invalid sequence number");
+                return Ok(());
+            }
+
+            if !self.unacked.is_empty() {
+                let data_start = if self.send.una == self.send.iss {
+                    self.send.una.wrapping_add(1)
+                } else {
+                    self.send.una
+                };
+                let acked_data_end =
+                    std::cmp::min(ackn.wrapping_sub(data_start) as usize, self.unacked.len());
+                self.unacked.drain(..acked_data_end);
+                self.send.una = ackn;
+            }
         }
 
         if let State::FinWait1 = self.state {
             if self.send.una == self.send.iss + 2 {
-                info!("Got ACK for our FIN");
+                debug!("TCB::unpack::Fin-Wait1: Got ACK for our FIN");
                 self.state = State::FinWait2;
+            }
+        }
+
+        if !data.is_empty() {
+            if let State::Estab | State::FinWait1 | State::FinWait2 = self.state {
+                let mut unread_data_at = self.recv.nxt.wrapping_sub(seqn) as usize;
+                debug!(
+                    "TCB::unpack: seqn: {}, recv.nxt: {}, unread: {}",
+                    seqn, self.recv.nxt, unread_data_at
+                );
+                if unread_data_at > data.len() {
+                    unread_data_at = 0;
+                }
+                debug!(
+                    "TCB::unpack: unread_data_at: {:02x?}",
+                    &data[unread_data_at..]
+                );
+                self.incoming.extend(&data[unread_data_at..]);
+                self.recv.nxt = seqn.wrapping_add(data_len);
+                // self.write(nic, self.send.nxt)?;
             }
         }
 
         if tcp_header.fin() {
             match self.state {
                 State::FinWait2 => {
-                    info!("TCP Connection closed with time wait");
+                    debug!("TCB::unpack: connection state turn into TimeWait");
                     self.write(nic, &[]);
                     self.state = State::TimeWait;
                 }
@@ -309,4 +349,21 @@ impl TCB {
 
         Ok(())
     }
+
+    pub fn availability(&self) -> Available {
+        Available::READ
+    }
+
+    pub fn is_recv_closed(&self) -> bool {
+        if let State::TimeWait = self.state {
+            true
+        } else {
+            false
+        }
+    }
+}
+
+pub enum Available {
+    READ,
+    WRITE,
 }
