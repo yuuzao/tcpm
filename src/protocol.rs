@@ -25,6 +25,7 @@ pub struct Timers {
     send_times: BTreeMap<u32, time::Instant>,
     srtt: f64,
 }
+#[derive(Debug)]
 enum State {
     SynRcvd,
     Estab,
@@ -390,16 +391,9 @@ impl TCB {
             match self.state {
                 State::FinWait2 => {
                     debug!("TCB::unpack: connection state turn into TimeWait");
-                    self.write(nic, self.send.nxt, 0);
+                    self.recv.nxt = self.recv.nxt.wrapping_add(1);
+                    self.write(nic, self.send.nxt, 0).unwrap();
                     self.state = State::TimeWait;
-                }
-                State::Estab => {
-                    // fist, sending ack for this FIN.
-                    self.write(nic, self.send.nxt, 0);
-
-                    //TODO: second: send own pending data and CLOSE-WAIT
-                    //TODO: third: send FIN(call close()) and LAST-ACK
-                    unimplemented!();
                 }
                 _ => unimplemented!(),
             }
