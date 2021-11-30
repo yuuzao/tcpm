@@ -1,5 +1,5 @@
 use crate::util;
-use log::debug;
+use log::{debug, info};
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::time;
@@ -27,20 +27,17 @@ pub struct Timers {
 }
 #[derive(Debug)]
 enum State {
+    Listen,
+    Closing,
+    Closed,
+    LastAck,
+    SynSent,
     SynRcvd,
     Estab,
     FinWait1,
     FinWait2,
     TimeWait,
     CloseWait,
-}
-
-enum TcpControl {
-    None,
-    RST,
-    FIN,
-    ACK,
-    SYN,
 }
 
 struct SendSequenceSpace {
@@ -82,46 +79,36 @@ impl RecvSequenceSpace {
     }
 }
 
+pub enum Available {
+    READ,
+    WRITE,
+}
+pub enum Action {
+    Close,
+    Continue,
+    Read,
+}
 impl TCB {
-    /// listen on a port, return the
-    pub fn new(
-        nic: &mut tun_tap::Iface,
-        ip_header: etherparse::Ipv4HeaderSlice,
-        tcp_header: etherparse::TcpHeaderSlice,
-    ) -> io::Result<Option<Self>> {
-        if !tcp_header.syn() {
-            return Ok(None);
-        }
-
+    fn new(ip_header: etherparse::Ipv4Header, tcp_header: etherparse::TcpHeader) -> Self {
         let iss = 0;
-        let mut tcb = Self {
+        Self {
             state: State::SynRcvd,
-            send: SendSequenceSpace::new(iss, tcp_header.window_size()),
+            send: SendSequenceSpace::new(iss, tcp_header.window_size),
             recv: RecvSequenceSpace::new(
-                tcp_header.sequence_number(),
-                tcp_header.sequence_number() + 1,
+                tcp_header.sequence_number,
+                tcp_header.sequence_number + 1,
                 1024,
             ),
             ip_header: etherparse::Ipv4Header::new(
                 0,
                 64,
                 etherparse::IpTrafficClass::Tcp,
-                [
-                    ip_header.destination()[0],
-                    ip_header.destination()[1],
-                    ip_header.destination()[2],
-                    ip_header.destination()[3],
-                ],
-                [
-                    ip_header.source()[0],
-                    ip_header.source()[1],
-                    ip_header.source()[2],
-                    ip_header.source()[3],
-                ],
+                ip_header.destination,
+                ip_header.source,
             ),
             tcp_header: etherparse::TcpHeader::new(
-                tcp_header.destination_port(),
-                tcp_header.source_port(),
+                tcp_header.destination_port,
+                tcp_header.source_port,
                 iss,
                 1024,
             ),
@@ -133,7 +120,18 @@ impl TCB {
                 send_times: Default::default(),
                 srtt: time::Duration::from_secs(1 * 60).as_secs_f64(),
             },
-        };
+        }
+    }
+    pub fn new_connection(
+        nic: &mut tun_tap::Iface,
+        ip_header: etherparse::Ipv4HeaderSlice,
+        tcp_header: etherparse::TcpHeaderSlice,
+    ) -> io::Result<Option<Self>> {
+        if !tcp_header.syn() {
+            return Ok(None);
+        }
+        let mut tcb = TCB::new(ip_header.to_header(), tcp_header.to_header());
+
         tcb.tcp_header.syn = true;
         tcb.tcp_header.ack = true;
 
@@ -159,7 +157,6 @@ impl TCB {
                 limit = 0;
             }
         }
-
         let (mut head, mut tail) = self.unacked.as_slices();
         if head.len() >= offset {
             head = &head[offset..];
@@ -240,166 +237,13 @@ impl TCB {
             self.tcp_header.fin = false;
         }
 
-        if util::wrapping_lt(self.send.nxt, next_seq) {
+        if util::lt(self.send.nxt, next_seq) {
             self.send.nxt = next_seq;
         }
         self.timers.send_times.insert(seq, time::Instant::now());
 
         nic.send(&buf[..payload_ends_at]).unwrap();
         Ok(payload_bytes)
-    }
-
-    /// Operations on a received packet. See RFC 793 page 65 Segment Arrives
-    pub fn unpack(
-        &mut self,
-        nic: &mut tun_tap::Iface,
-        tcp_header: etherparse::TcpHeaderSlice,
-        data: &[u8],
-    ) -> io::Result<()> {
-        // first, check if the sequence numbers are valid.
-        // see RFC 793 page 24, it is complicated.
-
-        debug!("TCB::unpack: data content length: {}", &data.len());
-
-        let mut data_len = data.len() as u32; //check if segment is zero.
-        let seqn = tcp_header.sequence_number();
-
-        // then, figure out what is this packet used for. SYN, FIN or normal.
-        if tcp_header.syn() {
-            // After that, the connection is established.
-            // we need to send ACK later for the third handshake.
-            // After that, the connection is established.
-            data_len += 1;
-        }
-        if tcp_header.fin() {
-            data_len += 1;
-        }
-
-        // RFC 793 page 25, comparisons for sequence number
-        let wend = self.recv.nxt.wrapping_add(self.recv.wnd as u32);
-        let acceptable = if data_len == 0 {
-            // segment is zero, see the comparisons in RFC 793 page 24
-            if self.recv.wnd == 0 {
-                if seqn != self.recv.nxt {
-                    false
-                } else {
-                    true
-                }
-            } else if !util::is_between_wrapped(self.recv.nxt.wrapping_sub(1), seqn, wend) {
-                false
-            } else {
-                true
-            }
-        } else {
-            // normal segment which length is not zero
-            if self.recv.wnd == 0 {
-                false
-            } else if !util::is_between_wrapped(self.recv.nxt.wrapping_sub(1), seqn, wend) {
-                false
-            } else {
-                true
-            }
-        };
-
-        if !acceptable {
-            debug!("TCB::unpack: Packet not acceptable");
-            self.write(nic, self.send.nxt, 0).expect("TCB write failed");
-            return Ok(());
-        }
-
-        if !tcp_header.ack() {
-            debug!("TCB::unpack: Packet does not have a ACK bit");
-            return Ok(());
-        }
-        let ackn = tcp_header.acknowledgment_number();
-        if let State::SynRcvd = self.state {
-            // RFC 793 page 69, SEGMENT ARRIVES for Syn-Rcvd state
-            // first check sequence number
-            if util::is_between_wrapped(
-                self.send.una.wrapping_sub(1),
-                ackn,
-                self.send.nxt.wrapping_add(1),
-            ) {
-                self.state = State::Estab;
-            } else {
-                // second check RST
-                // third check security and precedence
-                // TODO
-            }
-        }
-
-        if let State::Estab | State::FinWait1 | State::FinWait2 = self.state {
-            // RFC 793 page 69, "SEGMENT ARRIVES" handling for states above
-            // first check sequence number
-            // Wont' fix: second check RST
-            // Wont' fix: third check security and precedence
-            // Not here: fourth, check the SYN bit
-            // fifth check the ACK field
-            // sixth, check the URG bit
-            // seventh, process the segment text
-            // eighth, check the FIN bit
-
-            debug!(
-                "self.una {},ackn{}, self.nxt {}",
-                self.send.una, ackn, self.send.nxt
-            );
-
-            if util::is_between_wrapped(self.send.una, ackn, self.send.nxt.wrapping_add(1)) {
-                if !self.unacked.is_empty() {
-                    let data_start = if self.send.una == self.send.iss {
-                        self.send.una.wrapping_add(1)
-                    } else {
-                        self.send.una
-                    };
-                    let acked_data_end =
-                        std::cmp::min(ackn.wrapping_sub(data_start) as usize, self.unacked.len());
-                    self.unacked.drain(..acked_data_end);
-                }
-                self.send.una = ackn;
-            }
-        }
-
-        if let State::FinWait1 = self.state {
-            if let Some(closed_at) = self.closed_at {
-                if self.send.una == closed_at.wrapping_add(1) {
-                    self.state = State::FinWait2;
-                }
-            }
-        }
-
-        if !data.is_empty() {
-            if let State::Estab | State::FinWait1 | State::FinWait2 = self.state {
-                let mut unread_data_at = self.recv.nxt.wrapping_sub(seqn) as usize;
-                debug!(
-                    "TCB::unpack: seqn: {}, recv.nxt: {}, unread: {}",
-                    seqn, self.recv.nxt, unread_data_at
-                );
-                if unread_data_at > data.len() {
-                    unread_data_at = 0;
-                }
-                debug!(
-                    "TCB::unpack: unread_data_at: {:02x?}",
-                    &data[unread_data_at..]
-                );
-                self.incoming.extend(&data[unread_data_at..]);
-                self.recv.nxt = seqn.wrapping_add(data_len);
-                self.write(nic, self.send.nxt, 0)?;
-            }
-        }
-
-        if tcp_header.fin() {
-            match self.state {
-                State::FinWait2 => {
-                    debug!("TCB::unpack: connection state turn into TimeWait");
-                    self.recv.nxt = self.recv.nxt.wrapping_add(1);
-                    self.write(nic, self.send.nxt, 0).unwrap();
-                    self.state = State::TimeWait;
-                }
-                _ => unimplemented!(),
-            }
-        }
-
-        Ok(())
     }
 
     pub fn close(&mut self) -> io::Result<()> {
@@ -483,8 +327,201 @@ impl TCB {
 
         Ok(())
     }
-}
-pub enum Available {
-    READ,
-    WRITE,
+    /// RFC 793 page 36
+    pub fn send_rst(&mut self, nic: &mut tun_tap::Iface) -> io::Result<()> {
+        match self.state {
+            State::SynRcvd => {
+                self.tcp_header.rst = true;
+            }
+            _ => {}
+        }
+
+        self.write(nic, self.send.nxt, 0).unwrap();
+        Ok(())
+    }
+
+    /// Operations on a received packet. See RFC 793 page 65 Segment Arrives
+    /// NOTE: this method does not deal with the SYN for the first handshake when passive OPEN,
+    /// which means the SYN occurs here is "illegal".
+    pub fn on_segment(
+        &mut self,
+        nic: &mut tun_tap::Iface,
+        tcp_header: etherparse::TcpHeaderSlice,
+        data: &[u8],
+    ) -> io::Result<Action> {
+        debug!("on segmenting, self state: {:?}", self.state);
+        match self.state {
+            State::SynSent | State::Listen => {
+                // we didn't implement active open yet.
+                unimplemented!()
+            }
+            State::SynRcvd
+            | State::Estab
+            | State::FinWait1
+            | State::FinWait2
+            | State::CloseWait
+            | State::LastAck
+            | State::TimeWait => {
+                // RFC793 page 69
+
+                // first check sequence number
+                if let false = self.check_seq(data, &tcp_header) {
+                    if tcp_header.rst() {
+                        return Ok(Action::Close);
+                    }
+                    self.write(nic, self.send.nxt, 0).unwrap();
+                    return Ok(Action::Continue);
+                }
+
+                // second check the RST bit
+                if tcp_header.rst() {
+                    // NOTE: operation on passive open are different to active open, here is
+                    // passive open
+                    if let State::SynRcvd = self.state {
+                        self.state = State::Listen;
+                        return Ok(Action::Continue);
+                    } else {
+                        self.state = State::Closed;
+                        return Ok(Action::Close);
+                    }
+                }
+
+                // third check security and precedence, NOT DONE
+                // fourth check the SYN bit
+                if tcp_header.syn() {
+                    self.send_rst(nic).unwrap();
+                    self.state = State::Closed;
+                    return Ok(Action::Close);
+                };
+
+                // fifth check the Ack bit
+                // DO NOT use match pattern
+                {
+                    if !tcp_header.ack() {
+                        return Ok(Action::Continue);
+                    }
+                    let ackn = tcp_header.acknowledgment_number();
+                    if let State::SynRcvd = self.state {
+                        if util::le(self.send.una, ackn) && util::le(ackn, self.send.nxt) {
+                            self.state = State::Estab;
+                            // cannot return yet, there may be a FIN
+                        } else {
+                            self.send_rst(nic).unwrap();
+                        }
+                    }
+                    if let State::Estab | State::CloseWait = self.state {
+                        // ackn too small, ignore
+                        if util::lt(ackn, self.send.una) {
+                            return Ok(Action::Continue);
+                        }
+                        // ackn just fits
+                        if util::lt(self.send.una, ackn) && util::le(ackn, self.send.nxt) {
+                            self.send.una = ackn;
+                            // do not return right now
+                            // TODO: update send wnd, NOT IMPLEMENTED, not necessary right now.
+                        }
+                        // ackn too large
+                        if util::lt(self.send.nxt, ackn) {
+                            self.write(nic, self.send.nxt, 0).unwrap();
+                            return Ok(Action::Continue);
+                        }
+                    }
+
+                    // this ACK is for our FIN, and we now turn into FinWait2
+                    if let State::FinWait1 = self.state {
+                        self.state = State::FinWait2
+                    }
+                    if let State::FinWait2 = self.state {
+                        // This ACK must comes with FIN
+                    }
+                    if let State::LastAck = self.state {
+                        self.state = State::Closed;
+                        return Ok(Action::Close);
+                    }
+                    if let State::TimeWait = self.state {
+                        // Here we received the retransmission queue of FIN, we should ACK this FIN
+                        if !tcp_header.fin() {
+                            return Err(io::Error::new(
+                                io::ErrorKind::Other,
+                                "ack without FIN but in timewait???",
+                            ));
+                        }
+                        self.write(nic, self.send.nxt, 0).unwrap();
+                        return Ok(Action::Continue);
+                    }
+                };
+
+                // sixth check the URG bit, NOT DONE
+                // seventh, process the segment text
+                let seqn = tcp_header.sequence_number();
+                match self.state {
+                    State::Estab | State::FinWait1 | State::FinWait2 => {
+                        if !data.is_empty() {
+                            self.incoming.extend(&data[..]);
+                            self.recv.nxt = seqn.wrapping_add(data.len() as u32);
+                        }
+                        if tcp_header.fin() {
+                            self.recv.nxt = 1u32.wrapping_add(self.recv.nxt);
+                        }
+                        self.write(nic, self.send.nxt, 0).unwrap();
+                    }
+                    _ => {}
+                }
+
+                // eighth check the FIN bit
+                if tcp_header.fin() {
+                    match self.state {
+                        State::Closed | State::Listen | State::SynSent => {
+                            return Ok(Action::Continue)
+                        }
+                        State::SynRcvd | State::Estab => self.state = State::CloseWait,
+                        State::FinWait1 => {
+                            if tcp_header.ack() {
+                                // NOTE: This ACK is not always for our sent FIN in reality, here is the
+                                // ideal situation.
+                                self.state = State::TimeWait;
+                            } else {
+                                self.state = State::Closing;
+                            }
+                        }
+                        State::FinWait2 => {
+                            self.state = State::TimeWait;
+                        }
+
+                        _ => {}
+                    }
+                }
+            }
+
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "Unsupported connection state",
+                ))
+            }
+        }
+
+        Ok(Action::Read)
+    }
+
+    fn check_seq(&mut self, data: &[u8], tcp_header: &etherparse::TcpHeaderSlice) -> bool {
+        let in_wnd = util::segment_valid(
+            self.recv.nxt,
+            tcp_header.sequence_number(),
+            self.recv.nxt.wrapping_add(self.recv.wnd as u32),
+        );
+        if data.len() == 0 {
+            if self.recv.wnd == 0 {
+                return tcp_header.sequence_number() == self.recv.nxt;
+            } else {
+                return in_wnd;
+            }
+        } else {
+            if self.recv.wnd > 0 {
+                return in_wnd;
+            } else {
+                return false;
+            }
+        }
+    }
 }

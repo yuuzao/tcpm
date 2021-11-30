@@ -3,7 +3,7 @@ use crate::stream::TcpListener;
 use crate::stream::{Acm, SocketPair};
 use log::{debug, error, info};
 use nix;
-use std::collections::{hash_map::Entry, HashMap, VecDeque};
+use std::collections::{hash_map::Entry, VecDeque};
 use std::io;
 use std::thread;
 use tun_tap;
@@ -84,7 +84,6 @@ fn send(mut nic: tun_tap::Iface, acm: Acm) -> io::Result<()> {
 /// This function is initialized by the new() method of Interface. It will
 /// never ends and watches the incoming tcp packets and then notify the
 /// related threads to process on.
-// TODO: ih.notify
 fn packet_loop(mut nic: tun_tap::Iface, acm: Acm) -> io::Result<()> {
     info!("packet loop starts");
 
@@ -124,17 +123,8 @@ fn packet_loop(mut nic: tun_tap::Iface, acm: Acm) -> io::Result<()> {
                 // let's ignore non-TCP packets
                 //LINK https://en.wikipedia.org/wiki/List_of_IP_protocol_numbers
                 if ip_header.protocol() != 6 {
-                    // debug!(
-                    //     "Interface: not a TCP packet, protocol number is {}",
-                    //     ip_header.protocol()
-                    // );
                     continue;
                 }
-
-                debug!(
-                    "Interface: got a TCP packet, Ipv4 Packet content length: {}",
-                    buf_len
-                );
 
                 // ihl in ip header stands for the ip header's length, note the unit is 4bytes.
                 match etherparse::TcpHeaderSlice::from_slice(
@@ -161,45 +151,58 @@ fn packet_loop(mut nic: tun_tap::Iface, acm: Acm) -> io::Result<()> {
                         match cm.connections.entry(sp) {
                             //new connection comes as vacant
                             Entry::Vacant(con) => {
-                                debug!("Interface: Got a packet from a new client");
                                 if let Some(pending) = cm.pending.get_mut(&local_port) {
-                                    debug!(
-                                        "Listener: port is on, now trying to establish connection"
-                                    );
-                                    if let Some(c) = TCB::new(&mut nic, ip_header, tcp_header)? {
-                                        debug!("Listener: connection established");
+                                    if let Some(c) =
+                                        TCB::new_connection(&mut nic, ip_header, tcp_header)?
+                                    {
+                                        info!("new connection into pending");
                                         con.insert(c);
                                         pending.push_back(sp);
+                                        // cm must be dropped before notify_all.
                                         drop(cm);
                                         acm.estab_notifier.notify_all();
                                     }
                                 } else {
-                                    debug!("Listener: Port is off, ignoring...")
+                                    info!("Listener: Port is off, ignoring...")
                                 }
                             }
 
-                            // existed connections comes as occupied
-                            // TODO: complete this
+                            // Existed connections comes into occupied
                             Entry::Occupied(mut con) => {
-                                debug!("Interface: got a packet from known a connection");
-
                                 let data_start = ip_header.ihl() as usize * 4
                                     + tcp_header.slice().len() as usize;
-                                con.get_mut()
-                                    .unpack(&mut nic, tcp_header, &buf[data_start..buf_len])
-                                    .expect("unpacking TCP packet failed");
+                                let act = con
+                                    .get_mut()
+                                    // .unpack(&mut nic, tcp_header, &buf[data_start..buf_len])
+                                    .on_segment(&mut nic, tcp_header, &buf[data_start..buf_len])
+                                    .unwrap();
+                                use crate::protocol::Action;
                                 drop(cm);
-                                acm.reading_notifier.notify_all();
+                                match act {
+                                    Action::Continue => continue,
+                                    Action::Close => return Ok(()),
+                                    Action::Read => acm.reading_notifier.notify_all(),
+                                }
+
+                                // TODO: check close
+                                // immediately close done in read, because we handle recv here
+                                // 1: notify read, 0: abort right now
+                                // if sig == 0 {
+                                //     close!
+                                // }
+                                // drop(cm);
+                                // cm must be dropped before notify_all.
+                                // acm.reading_notifier.notify_all();
                             }
                         }
                     }
                     Err(e) => {
-                        error!("parsed some weird tcp packet: {:?}", e);
+                        error!("parsed some weird TCP packet: {:?}", e);
                     }
                 }
             }
             Err(e) => {
-                error!("parse some weird ip packets: {:?}", e);
+                error!("parse some weird IP packets: {:?}", e);
             }
         }
     }

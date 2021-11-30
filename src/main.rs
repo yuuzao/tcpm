@@ -14,11 +14,9 @@ fn main() -> io::Result<()> {
     while let Ok(mut stream) = listener.try_new() {
         info!("Main: Got connection!");
 
-        // TODO: replace this with function above
         thread::spawn(move || {
-            stream.write(b"hello world\n").unwrap();
-            stream.write(b"foo bar\n").unwrap();
-            stream.shutdown(std::net::Shutdown::Write).unwrap();
+            stream.write(b"hello from tcpm, oh yes!\n").unwrap();
+            stream.shutdown().unwrap();
             loop {
                 let mut buf = [0; 1024];
                 let n = stream.read(&mut buf[..]).unwrap();

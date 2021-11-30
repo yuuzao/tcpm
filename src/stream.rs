@@ -150,7 +150,7 @@ impl Write for TcpStream {
     }
 }
 impl TcpStream {
-    pub fn shutdown<T>(&self, t: T) -> io::Result<()> {
+    pub fn shutdown(&self) -> io::Result<()> {
         let mut m = self.m.manager.lock().unwrap();
         let c = m.connections.get_mut(&self.socketpair).ok_or_else(|| {
             io::Error::new(

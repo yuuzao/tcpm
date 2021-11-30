@@ -14,10 +14,14 @@ pub fn logging(level: &str) {
     .unwrap();
 }
 
-pub fn is_between_wrapped(start: u32, x: u32, end: u32) -> bool {
-    wrapping_lt(start, x) && wrapping_lt(x, end)
+pub fn segment_valid(start: u32, x: u32, end: u32) -> bool {
+    le(start, x) && lt(x, end)
 }
 
-pub fn wrapping_lt(lhs: u32, rhs: u32) -> bool {
+pub fn lt(lhs: u32, rhs: u32) -> bool {
     lhs.wrapping_sub(rhs) > (1 << 31)
+}
+
+pub fn le(lhs: u32, rhs: u32) -> bool {
+    lt(lhs, rhs) || lhs == rhs
 }
