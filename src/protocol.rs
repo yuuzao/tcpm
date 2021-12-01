@@ -2,6 +2,7 @@ use crate::util;
 use log::{debug, info};
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
+use std::mem;
 use std::time;
 
 pub struct TCB {
@@ -416,6 +417,18 @@ impl TCB {
                         }
                         // ackn just fits
                         if util::lt(self.send.una, ackn) && util::le(ackn, self.send.nxt) {
+                            // 1. update send.una
+                            // 2. Any segments on the retransmission queue which are thereby
+                            //    entirely acknowledged are removed
+                            // NOTE: only use clear() in ideal situation.So we do a assert.
+                            assert_eq!(
+                                self.unacked.len().wrapping_add(1) as u32,
+                                ackn.wrapping_sub(self.send.una)
+                            );
+                            self.unacked.clear();
+
+                            self.update_srtt(ackn).unwrap();
+
                             self.send.una = ackn;
                             // do not return right now
                             // TODO: update send wnd, NOT IMPLEMENTED, not necessary right now.
@@ -523,5 +536,24 @@ impl TCB {
                 return false;
             }
         }
+    }
+
+    /// reset timeout and update srtt
+    fn update_srtt(&mut self, ackn: u32) -> io::Result<()> {
+        let acked = std::mem::replace(&mut self.timers.send_times, BTreeMap::new());
+        let una = self.send.una;
+        self.timers
+            .send_times
+            .extend(acked.into_iter().filter_map(|(seq, sent)| {
+                if util::segment_valid(una, seq, ackn) {
+                    // SRTT = ( ALPHA * SRTT ) + ((1-ALPHA) * RTT)
+                    self.timers.srtt =
+                        0.8 * self.timers.srtt + (1.0 - 0.8) * sent.elapsed().as_secs_f64();
+                    None
+                } else {
+                    Some((seq, sent))
+                }
+            }));
+        Ok(())
     }
 }
