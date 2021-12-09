@@ -1,12 +1,14 @@
+use crate::protocol::Action;
 use crate::protocol::TCB;
 use crate::stream::TcpListener;
 use crate::stream::{Acm, SocketPair};
-use log::{debug, error, info};
+use log::{error, info};
 use nix;
 use std::collections::{hash_map::Entry, VecDeque};
 use std::io;
 use std::thread;
 use tun_tap;
+
 pub struct Interface {
     jh: Option<thread::JoinHandle<io::Result<()>>>,
     m: Option<Acm>,
@@ -14,7 +16,7 @@ pub struct Interface {
 
 impl Interface {
     pub fn new(ifacename: &str) -> io::Result<Self> {
-        debug!("Interface: created new interface");
+        info!("Interface: created new interface");
         let nic = tun_tap::Iface::without_packet_info(ifacename, tun_tap::Mode::Tun)
             .expect("Failed to create interface");
 
@@ -63,32 +65,14 @@ impl Interface {
     }
 }
 
-fn send(mut nic: tun_tap::Iface, acm: Acm) -> io::Result<()> {
-    use std::os::unix::io::AsRawFd;
-    let mut pfd = [nix::poll::PollFd::new(
-        nic.as_raw_fd(),
-        nix::poll::PollFlags::POLLIN,
-    )];
-    let n = nix::poll::poll(&mut pfd[..], 10).unwrap();
-    assert_ne!(n, -1);
-    if n == 0 {
-        let mut cm = acm.manager.lock().unwrap();
-        for c in cm.connections.values_mut() {
-            c.on_tick(&mut nic)?;
-        }
-    }
-    assert_eq!(n, 1);
-    Ok(())
-}
-
-/// This function is initialized by the new() method of Interface. It will
-/// never ends and watches the incoming tcp packets and then notify the
-/// related threads to process on.
+/// This function is initialized by the new() method of Interface. It is a loop
+/// for writing and reading.
+/// We use epoll for incoming data, reading will be waked up if the POLLIN fd is
+/// positive. If there's no incoming data, on_tick will be waked up for writing.
 fn packet_loop(mut nic: tun_tap::Iface, acm: Acm) -> io::Result<()> {
-    info!("packet loop starts");
-
+    info!("packet loop begins!");
     let mut buf = [0u8; 1500];
-
+    let mut pending_remove: Vec<SocketPair> = vec![];
     loop {
         use std::os::unix::io::AsRawFd;
         let mut pfd = [nix::poll::PollFd::new(
@@ -96,14 +80,26 @@ fn packet_loop(mut nic: tun_tap::Iface, acm: Acm) -> io::Result<()> {
             nix::poll::PollFlags::POLLIN,
         )];
         let n = nix::poll::poll(&mut pfd[..], 10).unwrap();
-        assert_ne!(n, -1);
+
+        let mut cm_guard = acm.manager.lock().unwrap();
+        while let Some(k) = pending_remove.pop() {
+            cm_guard.connections.remove(&k);
+            info!("connection {:?} removed", &k);
+        }
+        drop(cm_guard);
+
         if n == 0 {
-            let mut cm = acm.manager.lock().unwrap();
-            for c in cm.connections.values_mut() {
-                c.on_tick(&mut nic).unwrap();
+            let mut cm_guard = acm.manager.lock().unwrap();
+
+            for (k, v) in cm_guard.connections.iter_mut() {
+                let act = v.on_tick(&mut nic).unwrap();
+                if let Action::Close = act {
+                    pending_remove.push(k.clone());
+                };
             }
             continue;
         }
+
         assert_eq!(n, 1);
 
         let buf_len = nic.recv(&mut buf[..])?;
@@ -121,12 +117,11 @@ fn packet_loop(mut nic: tun_tap::Iface, acm: Acm) -> io::Result<()> {
         match etherparse::Ipv4HeaderSlice::from_slice(&buf[..buf_len]) {
             Ok(ip_header) => {
                 // let's ignore non-TCP packets
-                //LINK https://en.wikipedia.org/wiki/List_of_IP_protocol_numbers
+                // LINK https://en.wikipedia.org/wiki/List_of_IP_protocol_numbers
                 if ip_header.protocol() != 6 {
                     continue;
                 }
 
-                // ihl in ip header stands for the ip header's length, note the unit is 4bytes.
                 match etherparse::TcpHeaderSlice::from_slice(
                     &buf[ip_header.ihl() as usize * 4..buf_len],
                 ) {
@@ -148,22 +143,26 @@ fn packet_loop(mut nic: tun_tap::Iface, acm: Acm) -> io::Result<()> {
                             .expect("failed to get lock in packet_loop");
 
                         let cm = &mut *cm_guard;
-                        match cm.connections.entry(sp) {
+                        let act = match cm.connections.entry(sp) {
                             //new connection comes as vacant
                             Entry::Vacant(con) => {
                                 if let Some(pending) = cm.pending.get_mut(&local_port) {
                                     if let Some(c) =
-                                        TCB::new_connection(&mut nic, ip_header, tcp_header)?
+                                        TCB::new_connection(&mut nic, ip_header, tcp_header)
+                                            .unwrap()
                                     {
                                         info!("new connection into pending");
                                         con.insert(c);
                                         pending.push_back(sp);
-                                        // cm must be dropped before notify_all.
-                                        drop(cm);
-                                        acm.estab_notifier.notify_all();
+                                        Action::New
+                                    } else {
+                                        // TODO: recovery from old connection
+                                        info!("Old Connection exists");
+                                        Action::Close
                                     }
                                 } else {
-                                    info!("Listener: Port is off, ignoring...")
+                                    info!("Listener: Port is off, ignoring...");
+                                    Action::Close
                                 }
                             }
 
@@ -173,26 +172,24 @@ fn packet_loop(mut nic: tun_tap::Iface, acm: Acm) -> io::Result<()> {
                                     + tcp_header.slice().len() as usize;
                                 let act = con
                                     .get_mut()
-                                    // .unpack(&mut nic, tcp_header, &buf[data_start..buf_len])
                                     .on_segment(&mut nic, tcp_header, &buf[data_start..buf_len])
                                     .unwrap();
-                                use crate::protocol::Action;
-                                drop(cm);
-                                match act {
-                                    Action::Continue => continue,
-                                    Action::Close => return Ok(()),
-                                    Action::Read => acm.reading_notifier.notify_all(),
-                                }
-
-                                // TODO: check close
-                                // immediately close done in read, because we handle recv here
-                                // 1: notify read, 0: abort right now
-                                // if sig == 0 {
-                                //     close!
-                                // }
-                                // drop(cm);
-                                // cm must be dropped before notify_all.
-                                // acm.reading_notifier.notify_all();
+                                act
+                            }
+                        };
+                        // cm must be dropped before notify_all.
+                        match act {
+                            Action::New => {
+                                drop(cm_guard);
+                                acm.estab_notifier.notify_all()
+                            }
+                            Action::Read => {
+                                drop(cm_guard);
+                                acm.reading_notifier.notify_all()
+                            }
+                            Action::Continue => continue,
+                            Action::Close => {
+                                cm.connections.remove(&sp);
                             }
                         }
                     }

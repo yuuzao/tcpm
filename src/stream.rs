@@ -66,9 +66,6 @@ impl Read for TcpStream {
             .lock()
             .expect("failed to get lock in reading");
         loop {
-            cm = self.m.reading_notifier.wait(cm).unwrap();
-            debug!("Stream::Read: Reader awaked");
-
             let c = cm.connections.get_mut(&self.socketpair).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::ConnectionAborted,
@@ -81,32 +78,40 @@ impl Read for TcpStream {
                 return Ok(0);
             }
 
-            debug!("STREAM::READ: incoming empty? {}", c.incoming.is_empty());
-
             if !c.incoming.is_empty() {
                 debug!("Stream::Read: start reading");
-                //TODO: figure out vecdeque drain
-                let mut nread = 0;
+                // be careful for when reading from vecdeque.
+                let mut nread = buf.len();
                 let (head, tail) = c.incoming.as_slices();
-                let head_size = std::cmp::min(buf.len(), head.len());
-                buf[..head_size].copy_from_slice(&head[..head_size]);
-                nread += head_size;
 
-                let tail_size = std::cmp::min(buf.len() - nread, tail.len());
-                buf[nread..(nread + tail_size)].copy_from_slice(&tail[..tail_size]);
-                nread += tail_size;
+                if nread < head.len() {
+                    buf[..].copy_from_slice(&head[..nread]);
+                } else {
+                    let head_size = head.len();
+                    buf[..head_size].copy_from_slice(&head[..]);
+                    nread = head_size;
+                }
+                // NOTE: tail is empty because we NEVER call push_front().
+                assert_eq!(true, tail.is_empty());
+
                 //remember drop
                 drop(c.incoming.drain(..nread));
                 return Ok(nread);
             }
+
+            // NOTE: If the buf length is shorter than incoming queue, we MUST NOT run into wait
+            // until the incoming is fully read out or the left data will not be read until the
+            // next segment arrives.
+            cm = self.m.reading_notifier.wait(cm).unwrap();
         }
     }
 }
 impl Write for TcpStream {
     /// first we get the lock of ConnectionManager
     /// and we should check whether the TCB still exists.
-    /// then write the buffer into unacked
-    /// note that buffer size may exceed the unacked limit. So there may be several
+    /// then write the buffer into outgoing
+    /// note that buffer size may exceed the outgoing limit. So there may be
+    /// several
     /// TCP segments for this buffer.
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let mut m = self.m.manager.lock().unwrap();
@@ -116,16 +121,22 @@ impl Write for TcpStream {
                 "Stream was terminated unexpectedly",
             )
         })?;
-        if c.unacked.len() >= 1024 {
+        if c.closed {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "Stream write already closed",
+            ));
+        }
+        if c.outgoing.len() >= 1024 {
             // TODO: block
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "too many bytes buffered",
             ));
         };
-        let write_len = std::cmp::min(buf.len(), 1024 - c.unacked.len());
-        c.unacked.extend(buf[..write_len].iter());
-        info!("Stream::Write: c.unacked {:?} bytes", c.unacked.len());
+        let write_len = std::cmp::min(buf.len(), 1024 - c.outgoing.len());
+        c.outgoing.extend(buf[..write_len].iter());
+        info!("Stream::Write: c.outgoing  {:?} bytes", c.outgoing.len());
 
         Ok(write_len)
     }
@@ -138,7 +149,7 @@ impl Write for TcpStream {
             )
         })?;
 
-        if c.unacked.is_empty() {
+        if c.outgoing.is_empty() {
             Ok(())
         } else {
             // TODO: block

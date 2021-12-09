@@ -1,9 +1,10 @@
 use crate::util;
-use log::{debug, info};
+use log::debug;
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
-use std::mem;
+use std::io::Write;
 use std::time;
+use tun_tap::Iface;
 
 pub struct TCB {
     state: State,
@@ -11,7 +12,9 @@ pub struct TCB {
     recv: RecvSequenceSpace,
     ip_header: etherparse::Ipv4Header,
     tcp_header: etherparse::TcpHeader,
-    closed: bool,
+    pub(crate) closed: bool,
+
+    // the sequence number when FIN is sent.
     closed_at: Option<u32>,
     timers: Timers,
 
@@ -19,14 +22,14 @@ pub struct TCB {
     pub(crate) incoming: VecDeque<u8>,
 
     // stores the buffer to be sent, including unacked buffer
-    pub(crate) unacked: VecDeque<u8>,
+    pub(crate) outgoing: VecDeque<u8>,
 }
 
 pub struct Timers {
     send_times: BTreeMap<u32, time::Instant>,
     srtt: f64,
 }
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 enum State {
     Listen,
     Closing,
@@ -44,22 +47,28 @@ enum State {
 struct SendSequenceSpace {
     ///Send Sequence Variables, see RFC793 page 19 and page 25
 
+    /// initial sequence number for sending
+    iss: u32,
     /// unacknowledged
     una: u32,
+
     /// next sequence number for sending
     nxt: u32,
     /// send window
     wnd: u16,
-    /// initial sequence number for sending
-    iss: u32,
+
+    wl1: u32,
+    wl2: u32,
 }
 impl SendSequenceSpace {
-    fn new(iss: u32, wnd: u16) -> Self {
+    fn new(irs: u32, wnd: u16) -> Self {
         Self {
-            iss,
-            una: iss,
-            nxt: iss,
+            una: 0,
+            nxt: 0,
+            iss: 0,
             wnd,
+            wl1: irs,
+            wl2: irs,
         }
     }
 }
@@ -75,31 +84,39 @@ struct RecvSequenceSpace {
     irs: u32,
 }
 impl RecvSequenceSpace {
-    fn new(irs: u32, nxt: u32, wnd: u16) -> Self {
-        Self { nxt, wnd, irs }
+    fn new(irs: u32) -> Self {
+        Self {
+            nxt: irs + 1,
+            wnd: 1024,
+            irs,
+        }
     }
 }
 
-pub enum Available {
-    READ,
-    WRITE,
-}
+#[derive(Debug)]
 pub enum Action {
+    New,
     Close,
     Continue,
     Read,
 }
+
+#[derive(Debug)]
+pub enum Request {
+    ReTransmit,
+    RST,
+    SYN,
+    SYNACK,
+    ACK,
+    FIN,
+}
+
 impl TCB {
     fn new(ip_header: etherparse::Ipv4Header, tcp_header: etherparse::TcpHeader) -> Self {
-        let iss = 0;
         Self {
             state: State::SynRcvd,
-            send: SendSequenceSpace::new(iss, tcp_header.window_size),
-            recv: RecvSequenceSpace::new(
-                tcp_header.sequence_number,
-                tcp_header.sequence_number + 1,
-                1024,
-            ),
+            send: SendSequenceSpace::new(tcp_header.sequence_number, tcp_header.window_size),
+            recv: RecvSequenceSpace::new(tcp_header.sequence_number),
             ip_header: etherparse::Ipv4Header::new(
                 0,
                 64,
@@ -110,11 +127,11 @@ impl TCB {
             tcp_header: etherparse::TcpHeader::new(
                 tcp_header.destination_port,
                 tcp_header.source_port,
-                iss,
+                0,
                 1024,
             ),
-            incoming: Default::default(),
-            unacked: Default::default(),
+            incoming: VecDeque::default(),
+            outgoing: Default::default(),
             closed: false,
             closed_at: None,
             timers: Timers {
@@ -124,7 +141,7 @@ impl TCB {
         }
     }
     pub fn new_connection(
-        nic: &mut tun_tap::Iface,
+        nic: &mut Iface,
         ip_header: etherparse::Ipv4HeaderSlice,
         tcp_header: etherparse::TcpHeaderSlice,
     ) -> io::Result<Option<Self>> {
@@ -136,7 +153,8 @@ impl TCB {
         tcb.tcp_header.syn = true;
         tcb.tcp_header.ack = true;
 
-        tcb.write(nic, tcb.send.nxt, 0).unwrap();
+        // tcb.write(nic, tcb.send.nxt, 0).unwrap();
+        tcb.write(nic, Request::SYNACK).unwrap();
 
         Ok(Some(tcb))
     }
@@ -145,67 +163,83 @@ impl TCB {
     /// calculates the proper length of sending buffer from the unacked queue and adjusts TCB
     /// sends the buffer with tcp header to the nic
     /// return the length of sent buffer.
-    fn write(&mut self, nic: &mut tun_tap::Iface, seq: u32, mut limit: usize) -> io::Result<usize> {
+    fn write(&mut self, nic: &mut Iface, req: Request) -> io::Result<usize> {
         let mut buf = [0u8; 1500];
-        self.tcp_header.sequence_number = seq;
+        let mut next_seqn = 0u32;
+
+        self.tcp_header.sequence_number = match req {
+            Request::SYN | Request::SYNACK => {
+                self.tcp_header.syn = true;
+                next_seqn += 1;
+                self.send.nxt
+            }
+            Request::RST => {
+                self.tcp_header.rst = true;
+                self.send.nxt
+            }
+            Request::FIN => {
+                // FIXME: Do we have to respect the zero receive window?
+                assert!((self.state == State::FinWait1) | (self.state == State::LastAck));
+                self.tcp_header.fin = true;
+                next_seqn += 1;
+                self.send.nxt
+            }
+            Request::ReTransmit => {
+                //The sending TCP must regularly retransmit to the receiving TCP even when the window
+                //is zero.
+                if let State::FinWait1 | State::LastAck = self.state {
+                    self.tcp_header.fin = true;
+                };
+                self.send.una
+            }
+            Request::ACK => self.send.nxt,
+        };
         self.tcp_header.acknowledgment_number = self.recv.nxt;
 
-        let mut offset = seq.wrapping_sub(self.send.una) as usize;
-
-        if let Some(closed_at) = self.closed_at {
-            if seq == closed_at.wrapping_add(1) {
-                offset = 0;
-                limit = 0;
-            }
-        }
-        let (mut head, mut tail) = self.unacked.as_slices();
-        if head.len() >= offset {
-            head = &head[offset..];
-        } else {
-            let skipped = head.len();
-            head = &[];
-            tail = &tail[(offset - skipped)..];
-        }
-
-        let max_data = std::cmp::min(limit, tail.len() + head.len());
-        // the ip packet to be sent should not exceeds the MTU.
-        let data_size = std::cmp::min(
-            buf.len(),
-            self.tcp_header.header_len() as usize + self.ip_header.header_len() + max_data,
+        // length of the unacked data
+        let offset = self.send.nxt.wrapping_sub(self.send.una) as usize;
+        debug!(
+            "send.una: {:?}, snd.nxt: {:?}",
+            self.send.una, self.send.nxt
         );
 
+        let payload: &[u8] = {
+            if let Request::SYN | Request::SYNACK | Request::RST = req {
+                &[]
+            } else if self.outgoing.is_empty() {
+                &[]
+            } else {
+                if let Request::ReTransmit = req {
+                    &self.outgoing.as_slices().0[..offset]
+                } else {
+                    &self.outgoing.as_slices().0[offset..]
+                }
+            }
+        };
+
+        let data_size = std::cmp::min(
+            buf.len(),
+            self.tcp_header.header_len() as usize + self.ip_header.header_len() + payload.len(),
+        );
         self.ip_header
             .set_payload_len(data_size - self.ip_header.header_len())
             .unwrap();
 
-        // write the header and payload into buf.
-        // buf is an array which doesn't have write trait.
-        // we can use a slice for it.
-        // note: this slice references to the unwritten part for buf.
-        use std::io::Write;
+        // let's write the header and payload into buf.
+        // buf is an array which doesn't have write trait, so we have to create a slice for it.
+        // NOTE: this slice references to the unwritten part of buf.
         let buf_len = buf.len();
-        let mut writer = &mut buf[..];
+        let mut unwritten = &mut buf[..];
 
-        self.ip_header.write(&mut writer).unwrap();
-        let ip_header_ends_at = buf_len - writer.len();
+        // The write implementation of Ipv4header writes the ip header into it's parameter.
+        self.ip_header.write(&mut unwritten).unwrap();
+        let ip_header_ends_at = buf_len - unwritten.len();
 
-        writer = &mut writer[self.tcp_header.header_len() as usize..];
-        let tcp_header_ends_at = buf_len - writer.len();
+        unwritten = &mut unwritten[self.tcp_header.header_len() as usize..];
+        let tcp_header_ends_at = buf_len - unwritten.len();
 
-        let payload_bytes = {
-            let mut written = 0;
-            let mut limit = max_data;
-
-            let p1l = std::cmp::min(limit, head.len());
-            written += writer.write(&head[..p1l])?;
-            limit -= written;
-
-            let p2l = std::cmp::min(limit, tail.len());
-            written += writer.write(&tail[..p2l])?;
-
-            written
-        };
-        let payload_ends_at = buf_len - writer.len();
+        unwritten.write(payload).unwrap();
+        let payload_ends_at = buf_len - unwritten.len();
 
         self.tcp_header.checksum = self
             .tcp_header
@@ -213,61 +247,47 @@ impl TCB {
             .unwrap();
 
         let mut tcp_header_buf = &mut buf[ip_header_ends_at..tcp_header_ends_at];
-        self.tcp_header.write(&mut tcp_header_buf)?;
-
-        // update connection's send sequence space
-        let next_seq = seq.wrapping_add(payload_bytes as u32);
-        // SYN in tcp_header only occurs once in first or second handshake.
-        // FIN also only occurs once.
-        // they have to be removed after relative handshaking.
-        if self.tcp_header.syn {
-            // The SYN in header means this packet to be sent is for handshaking.
-            // So that the payload is empty, we need add 1 to send.nxt
-            self.send.nxt = self.send.nxt.wrapping_add(1);
-            self.tcp_header.syn = false;
-        }
-        if self.tcp_header.fin {
-            // If we initiate the close and set the FIN, we have to send a
-            // ACK later with empty data, so we need to add 1 to send.nxt, and
-            // remove the FIN.
-            // If we passively close the connection, when the FIN is set, we
-            // don't have to send any other packet later, we don't care about
-            // what the snd.nxt is. For convenient, we add 1 to it in the
-            // both scenarios.
-            self.send.nxt = next_seq.wrapping_add(1);
-            self.tcp_header.fin = false;
-        }
-
-        if util::lt(self.send.nxt, next_seq) {
-            self.send.nxt = next_seq;
-        }
-        self.timers.send_times.insert(seq, time::Instant::now());
+        self.tcp_header.write(&mut tcp_header_buf).unwrap();
 
         nic.send(&buf[..payload_ends_at]).unwrap();
-        Ok(payload_bytes)
+
+        next_seqn += payload.len() as u32;
+        self.send.nxt = self.send.nxt.wrapping_add(next_seqn);
+        self.tcp_header.fin = false;
+        self.tcp_header.syn = false;
+        self.timers
+            .send_times
+            .insert(self.send.una, time::Instant::now());
+
+        Ok(payload.len())
     }
 
     pub fn close(&mut self) -> io::Result<()> {
+        if self.closed {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "Connection already closed",
+            ));
+        }
         self.closed = true;
         match self.state {
-            State::SynRcvd | State::Estab => {
+            State::Estab => {
+                debug!("close called at ESTAB");
                 self.state = State::FinWait1;
             }
-            State::FinWait1 | State::FinWait2 => {}
+            State::CloseWait => {
+                debug!("should close from CLOSEWAIT");
+                self.state = State::LastAck;
+            }
             _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotConnected,
-                    "Already closing",
-                ))
+                debug!("close at improper state:{:?}", self.state);
+                unreachable!()
             }
         };
         Ok(())
     }
-    pub fn availability(&self) -> Available {
-        Available::READ
-    }
-
     pub fn is_recv_closed(&self) -> bool {
+        // TODO: completed, but not completely completed.
         if let State::TimeWait = self.state {
             true
         } else {
@@ -275,18 +295,17 @@ impl TCB {
         }
     }
 
-    pub fn on_tick(&mut self, nic: &mut tun_tap::Iface) -> io::Result<()> {
-        if let State::FinWait2 | State::TimeWait = self.state {
-            return Ok(());
-        }
+    /// a tiemr for unacked queue
+    // pub fn on_timer(&mut self, nic: &mut Iface) -> io::Result<Action> {
+    //     if let State::FinWait2 | State::LastAck = self.state {
+    //         return Ok(Action::Continue);
+    //     }
+    //
+    //     Ok(Action::Continue)
+    // }
 
-        let unacked_data = self
-            .closed_at
-            .unwrap_or(self.send.nxt)
-            .wrapping_sub(self.send.una);
-
-        let unsent_data_len = self.unacked.len() as u32 - unacked_data;
-
+    pub fn on_tick(&mut self, nic: &mut Iface) -> io::Result<Action> {
+        //first, we figure out whether to retransmit
         let waited_for = self
             .timers
             .send_times
@@ -294,42 +313,63 @@ impl TCB {
             .next()
             .map(|t| t.1.elapsed());
 
-        let should_retransmit = if let Some(waited_for) = waited_for {
-            waited_for > time::Duration::from_secs(1)
-                && waited_for.as_secs_f64() > 1.5 * self.timers.srtt
-        } else {
-            false
-        };
-
-        if should_retransmit {
-            let resend = std::cmp::min(self.unacked.len() as u32, self.send.wnd as u32);
-            if resend < self.send.wnd as u32 && self.closed {
-                self.tcp_header.fin = true;
-                self.closed_at = Some(self.send.una.wrapping_add(self.unacked.len() as u32))
-            }
-        } else {
-            if unsent_data_len == 0 && self.closed_at.is_some() {
-                return Ok(());
-            }
-
-            let allowed = self.send.wnd as u32 - unacked_data;
-            if allowed == 0 {
-                return Ok(());
-            }
-
-            let send = std::cmp::min(unsent_data_len, allowed);
-            if send < allowed && self.closed && self.closed_at.is_none() {
-                self.tcp_header.fin = true;
-                self.closed_at = Some(self.send.una.wrapping_add(self.unacked.len() as u32));
-            }
-
-            self.write(nic, self.send.nxt, send as usize)?;
+        let should_retransmit = waited_for.and_then(|x| {
+            Some(x > time::Duration::from_secs(1) && x.as_secs_f64() > 1.5 * self.timers.srtt)
+        });
+        if should_retransmit.unwrap_or(false) {
+            self.write(nic, Request::ReTransmit).unwrap();
+            return Ok(Action::Continue);
         }
 
-        Ok(())
+        // then, we send unsent data if threre is any.
+        let mut req = None;
+        match self.state {
+            State::FinWait2 => return Ok(Action::Continue),
+            State::FinWait1 => {
+                if self.closed_at.is_none() {
+                    self.closed_at = Some(self.send.una);
+                    req = Some(Request::FIN);
+                }
+            }
+            State::TimeWait => {
+                //FIXME: set correct MSL.
+                if waited_for.expect("timer error in TimeWait") >= time::Duration::from_secs(2) {
+                    debug!("timewait ends");
+                    return Ok(Action::Close);
+                } else {
+                    return Ok(Action::Continue);
+                }
+            }
+            _ => {}
+        }
+
+        let allowed = self.send.wnd as usize - self.outgoing.len();
+        match allowed {
+            // FIN wont' be sent if the allowed wnd is zero
+            0 => {
+                if let Some(Request::FIN) = req {
+                    self.closed_at = None;
+                };
+                return Ok(Action::Continue);
+            }
+            _ => {
+                let send = std::cmp::min(self.outgoing.len(), allowed);
+                if send <= allowed && !self.closed && !self.outgoing.is_empty() {
+                    req = Some(Request::ACK);
+                }
+            }
+        };
+        if req.is_some() {
+            debug!("send for req type: {:?}", req);
+            self.write(nic, req.unwrap())
+                .expect("on_tick: sending failed");
+        }
+        Ok(Action::Continue)
     }
+
     /// RFC 793 page 36
-    pub fn send_rst(&mut self, nic: &mut tun_tap::Iface) -> io::Result<()> {
+    pub fn send_rst(&mut self, nic: &mut Iface) -> io::Result<()> {
+        // TODO: completed, but not completely completed.
         match self.state {
             State::SynRcvd => {
                 self.tcp_header.rst = true;
@@ -337,7 +377,7 @@ impl TCB {
             _ => {}
         }
 
-        self.write(nic, self.send.nxt, 0).unwrap();
+        self.write(nic, Request::RST).unwrap();
         Ok(())
     }
 
@@ -346,38 +386,56 @@ impl TCB {
     /// which means the SYN occurs here is "illegal".
     pub fn on_segment(
         &mut self,
-        nic: &mut tun_tap::Iface,
+        nic: &mut Iface,
         tcp_header: etherparse::TcpHeaderSlice,
         data: &[u8],
     ) -> io::Result<Action> {
         debug!("on segmenting, self state: {:?}", self.state);
+
+        let ackn = tcp_header.acknowledgment_number();
+        let seqn = tcp_header.sequence_number();
         match self.state {
+            State::Closed => {
+                if !tcp_header.rst() {
+                    if tcp_header.ack() {
+                        ackn
+                    } else {
+                        seqn + data.len() as u32
+                    };
+                    // self.write(nic, c, 0).unwrap();
+                    self.write(nic, Request::ACK).unwrap();
+                    return Ok(Action::Close);
+                }
+            }
             State::SynSent | State::Listen => {
                 // we didn't implement active open yet.
-                unimplemented!()
+                unimplemented!();
             }
             State::SynRcvd
             | State::Estab
             | State::FinWait1
             | State::FinWait2
             | State::CloseWait
+            | State::Closing
             | State::LastAck
             | State::TimeWait => {
                 // RFC793 page 69
 
                 // first check sequence number
                 if let false = self.check_seq(data, &tcp_header) {
+                    debug!("sequence number invalid");
                     if tcp_header.rst() {
                         return Ok(Action::Close);
                     }
-                    self.write(nic, self.send.nxt, 0).unwrap();
+                    self.write(nic, Request::ACK).unwrap();
                     return Ok(Action::Continue);
                 }
 
                 // second check the RST bit
                 if tcp_header.rst() {
-                    // NOTE: operation on passive open are different to active open, here is
+                    // NOTE: operations on passive open are different to active open, here is for
                     // passive open
+                    debug!("recv RST");
                     if let State::SynRcvd = self.state {
                         self.state = State::Listen;
                         return Ok(Action::Continue);
@@ -390,127 +448,165 @@ impl TCB {
                 // third check security and precedence, NOT DONE
                 // fourth check the SYN bit
                 if tcp_header.syn() {
+                    debug!("recv dup SYN");
                     self.send_rst(nic).unwrap();
                     self.state = State::Closed;
                     return Ok(Action::Close);
                 };
 
+                debug!(
+                    "Segment is ok for reading. una: {:?}, ackn {:?}, nxt: {:?}, closed?: {:?}",
+                    self.send.una,
+                    tcp_header.acknowledgment_number(),
+                    self.send.nxt,
+                    self.closed
+                );
                 // fifth check the Ack bit
                 // DO NOT use match pattern
                 {
                     if !tcp_header.ack() {
                         return Ok(Action::Continue);
                     }
-                    let ackn = tcp_header.acknowledgment_number();
                     if let State::SynRcvd = self.state {
                         if util::le(self.send.una, ackn) && util::le(ackn, self.send.nxt) {
                             self.state = State::Estab;
                             // cannot return yet, there may be a FIN
                         } else {
                             self.send_rst(nic).unwrap();
+                            return Ok(Action::Continue);
                         }
                     }
-                    if let State::Estab | State::CloseWait = self.state {
+                    if let State::Estab
+                    | State::CloseWait
+                    | State::FinWait1
+                    | State::FinWait2
+                    | State::Closing = self.state
+                    {
                         // ackn too small, ignore
                         if util::lt(ackn, self.send.una) {
                             return Ok(Action::Continue);
                         }
+                        // ackn too large, send ack and return
+                        // FIXME: which ackn should be sent?
+                        if util::lt(self.send.nxt, ackn) {
+                            self.write(nic, Request::ACK).unwrap();
+                            // self.write(nic, self.send.nxt, 0).unwrap();
+                            return Ok(Action::Continue);
+                        }
+
                         // ackn just fits
                         if util::lt(self.send.una, ackn) && util::le(ackn, self.send.nxt) {
-                            // 1. update send.una
+                            // 1. update send.una to ackn
                             // 2. Any segments on the retransmission queue which are thereby
                             //    entirely acknowledged are removed
-                            // NOTE: only use clear() in ideal situation.So we do a assert.
-                            assert_eq!(
-                                self.unacked.len().wrapping_add(1) as u32,
-                                ackn.wrapping_sub(self.send.una)
-                            );
-                            self.unacked.clear();
+                            // NOTE: send.nxt will be updated in the next steps
+                            // NOTE: only use clear() in ideal situation.So we do an assert.
+                            // assert_eq!(self.unacked.len(), ackn.wrapping_sub(self.send.una));
+                            if util::lt(self.send.wl1, seqn)
+                                || (self.send.wl1 == seqn && util::le(self.send.wl2, ackn))
+                            {
+                                self.send.wnd = tcp_header.window_size();
+                                self.send.wl1 = seqn;
+                                self.send.wl2 = ackn;
+                            }
+
+                            self.outgoing.clear();
 
                             self.update_srtt(ackn).unwrap();
 
+                            debug!("ackn: {:?}, timer?: {:?}", ackn, self.timers.send_times);
                             self.send.una = ackn;
-                            // do not return right now
-                            // TODO: update send wnd, NOT IMPLEMENTED, not necessary right now.
-                        }
-                        // ackn too large
-                        if util::lt(self.send.nxt, ackn) {
-                            self.write(nic, self.send.nxt, 0).unwrap();
-                            return Ok(Action::Continue);
+                            self.timers.send_times.remove(&self.send.una);
+                            debug!("timer?: {:?}", self.timers.send_times);
+
+                            // NOTE: do not return and do not wirte anything right now, because
+                            // there may be a FIN.
                         }
                     }
 
-                    // this ACK is for our FIN, and we now turn into FinWait2
-                    if let State::FinWait1 = self.state {
-                        self.state = State::FinWait2
-                    }
-                    if let State::FinWait2 = self.state {
-                        // This ACK must comes with FIN
-                    }
-                    if let State::LastAck = self.state {
-                        self.state = State::Closed;
-                        return Ok(Action::Close);
-                    }
-                    if let State::TimeWait = self.state {
-                        // Here we received the retransmission queue of FIN, we should ACK this FIN
-                        if !tcp_header.fin() {
-                            return Err(io::Error::new(
-                                io::ErrorKind::Other,
-                                "ack without FIN but in timewait???",
-                            ));
+                    // This ACK is for our FIN which was sent with payloads together.
+                    if self.closed {
+                        // if self.closed_at.expect("why closed_at not set?") == ackn {
+                        if self.closed_at.is_some() {
+                            match self.state {
+                                State::FinWait1 => self.state = State::FinWait2,
+                                State::FinWait2 => {}
+                                State::Closing => self.state = State::TimeWait,
+                                State::LastAck => {
+                                    self.state = State::Closed;
+                                    return Ok(Action::Close);
+                                }
+                                State::TimeWait => {
+                                    // Here we received the retransmission queue of FIN, we should ACK this FIN
+                                    self.write(nic, Request::ACK).unwrap();
+                                    // self.write(nic, self.send.nxt, 0).unwrap();
+                                    self.timers
+                                        .send_times
+                                        .insert(self.send.una, time::Instant::now());
+                                    return Ok(Action::Continue);
+                                }
+                                _ => unreachable!(),
+                            }
                         }
-                        self.write(nic, self.send.nxt, 0).unwrap();
-                        return Ok(Action::Continue);
                     }
                 };
 
                 // sixth check the URG bit, NOT DONE
                 // seventh, process the segment text
-                let seqn = tcp_header.sequence_number();
-                match self.state {
-                    State::Estab | State::FinWait1 | State::FinWait2 => {
-                        if !data.is_empty() {
-                            self.incoming.extend(&data[..]);
-                            self.recv.nxt = seqn.wrapping_add(data.len() as u32);
-                        }
-                        if tcp_header.fin() {
-                            self.recv.nxt = 1u32.wrapping_add(self.recv.nxt);
-                        }
-                        self.write(nic, self.send.nxt, 0).unwrap();
+                let mut req: Option<Request> = None;
+                if let State::Estab | State::FinWait1 | State::FinWait2 = self.state {
+                    if !data.is_empty() {
+                        // If incoming has no space for this data, an error should return but we
+                        // still need to ack this data. (RFC 793 page 58). Since our incoming is
+                        // growable, we will not handle it.
+                        self.incoming.extend(&data[..]);
+                        self.recv.nxt = seqn.wrapping_add(data.len() as u32);
+                        req = Some(Request::ACK);
                     }
-                    _ => {}
                 }
 
                 // eighth check the FIN bit
+                // here we just only adjust the state.
                 if tcp_header.fin() {
+                    if let State::Closed | State::Listen | State::SynSent = self.state {
+                        return Ok(Action::Continue);
+                    }
+                    self.recv.nxt = 1u32.wrapping_add(self.recv.nxt);
+                    req = Some(Request::ACK);
+
                     match self.state {
-                        State::Closed | State::Listen | State::SynSent => {
-                            return Ok(Action::Continue)
-                        }
                         State::SynRcvd | State::Estab => self.state = State::CloseWait,
                         State::FinWait1 => {
-                            if tcp_header.ack() {
-                                // NOTE: This ACK is not always for our sent FIN in reality, here is the
-                                // ideal situation.
+                            if self.closed_at.expect("why closed_at not set?")
+                                == ackn.wrapping_sub(1)
+                            {
                                 self.state = State::TimeWait;
+                                self.timers
+                                    .send_times
+                                    .insert(self.send.una, time::Instant::now());
                             } else {
                                 self.state = State::Closing;
                             }
                         }
                         State::FinWait2 => {
                             self.state = State::TimeWait;
+                            self.timers
+                                .send_times
+                                .insert(self.send.una, time::Instant::now());
                         }
-
+                        State::TimeWait => {
+                            self.timers
+                                .send_times
+                                .insert(self.send.una, time::Instant::now());
+                        }
                         _ => {}
                     }
                 }
-            }
 
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "Unsupported connection state",
-                ))
+                debug!("on_segment-> now state: {:?}", self.state);
+                if req.is_some() {
+                    self.write(nic, req.unwrap()).unwrap();
+                }
             }
         }
 

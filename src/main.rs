@@ -2,12 +2,13 @@ use log::{debug, info};
 use std::io;
 use std::io::{Read, Write};
 use std::thread;
+use std::time;
 use tcpm::iface;
 use tcpm::util;
 
 fn main() -> io::Result<()> {
     // util::logging("debug");
-    util::logging("info");
+    util::logging("debug");
     let mut nic = iface::Interface::new("tcpm")?;
     info!("Main: created interface");
     let mut listener = nic.bind(8005)?;
@@ -16,18 +17,20 @@ fn main() -> io::Result<()> {
 
         thread::spawn(move || {
             stream.write(b"hello from tcpm, oh yes!\n").unwrap();
-            stream.shutdown().unwrap();
-            loop {
-                let mut buf = [0; 1024];
-                let n = stream.read(&mut buf[..]).unwrap();
-                debug!("read {}b data", n);
-                if n == 0 {
-                    info!("Main: No more incoming data");
-                    break;
-                } else {
-                    info!("{}", std::str::from_utf8(&buf[..]).unwrap());
-                }
+            // loop {
+            let mut buf = [0; 24];
+            let n = stream.read(&mut buf[..]).unwrap();
+            info!("read {}b data", n);
+            if n == 0 {
+                info!("Main: No more incoming data");
+                // break;
+            } else {
+                info!(">> {}", std::str::from_utf8(&buf[..]).unwrap());
             }
+            // }
+            stream.write(b"hello from tcpm, oh yes!\n").unwrap();
+
+            stream.shutdown().unwrap();
         });
     }
     Ok(())
