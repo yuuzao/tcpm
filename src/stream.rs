@@ -66,43 +66,46 @@ impl Read for TcpStream {
             .lock()
             .expect("failed to get lock in reading");
         loop {
-            let c = cm.connections.get_mut(&self.socketpair).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::ConnectionAborted,
-                    "stream terminated unexpectedly",
-                )
-            })?;
-
-            if c.is_recv_closed() && c.incoming.is_empty() {
-                debug!("Stream::Read: Recv closed and incoming empty, ending...");
-                return Ok(0);
-            }
-
-            if !c.incoming.is_empty() {
-                debug!("Stream::Read: start reading");
-                // be careful for when reading from vecdeque.
-                let mut nread = buf.len();
-                let (head, tail) = c.incoming.as_slices();
-
-                if nread < head.len() {
-                    buf[..].copy_from_slice(&head[..nread]);
-                } else {
-                    let head_size = head.len();
-                    buf[..head_size].copy_from_slice(&head[..]);
-                    nread = head_size;
+            cm = self.m.reading_notifier.wait(cm).unwrap();
+            // let c = cm.connections.get_mut(&self.socketpair).ok_or_else(|| {
+            //      io::Error::new(
+            //          io::ErrorKind::ConnectionAborted,
+            //          "stream terminated unexpectedly",
+            //      )
+            // })?;
+            if let Some(c) = cm.connections.get_mut(&self.socketpair) {
+                if c.closed && c.incoming.is_empty() {
+                    debug!("Stream::Read: Recv closed and incoming empty, ending...");
+                    return Ok(0);
                 }
-                // NOTE: tail is empty because we NEVER call push_front().
-                assert_eq!(true, tail.is_empty());
 
-                //remember drop
-                drop(c.incoming.drain(..nread));
-                return Ok(nread);
-            }
+                if !c.incoming.is_empty() {
+                    debug!("Stream::Read: start reading");
+                    // be careful for when reading from vecdeque.
+                    let mut nread = buf.len();
+                    let (head, tail) = c.incoming.as_slices();
+
+                    if nread < head.len() {
+                        buf[..].copy_from_slice(&head[..nread]);
+                    } else {
+                        let head_size = head.len();
+                        buf[..head_size].copy_from_slice(&head[..]);
+                        nread = head_size;
+                    }
+                    // NOTE: tail is empty because we NEVER call push_front().
+                    assert_eq!(true, tail.is_empty());
+
+                    //remember drop
+                    drop(c.incoming.drain(..nread));
+                    return Ok(nread);
+                } else {
+                    return Ok(1);
+                };
+            };
 
             // NOTE: If the buf length is shorter than incoming queue, we MUST NOT run into wait
             // until the incoming is fully read out or the left data will not be read until the
             // next segment arrives.
-            cm = self.m.reading_notifier.wait(cm).unwrap();
         }
     }
 }
@@ -162,6 +165,7 @@ impl Write for TcpStream {
 }
 impl TcpStream {
     pub fn shutdown(&self) -> io::Result<()> {
+        info!("shutdown called");
         let mut m = self.m.manager.lock().unwrap();
         let c = m.connections.get_mut(&self.socketpair).ok_or_else(|| {
             io::Error::new(

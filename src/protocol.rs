@@ -93,11 +93,19 @@ impl RecvSequenceSpace {
     }
 }
 
+/// actions when segment arrives
 #[derive(Debug)]
 pub enum Action {
+    // have to create a connection
     New,
+    // have to close connection
     Close,
+    // no more operation is needed, such as we have ACKed for a packet, received a ACK when we are
+    // in SynRcvd state
     Continue,
+    // we have to call stream to read for a packet. when we are in the states that have the ability
+    // to receive payloads, we have to call stream to read no matter whether the payload is empty
+    // or not.
     Read,
 }
 
@@ -263,12 +271,12 @@ impl TCB {
     }
 
     pub fn close(&mut self) -> io::Result<()> {
-        if self.closed {
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "Connection already closed",
-            ));
-        }
+        // if self.closed {
+        //     return Err(io::Error::new(
+        //         io::ErrorKind::BrokenPipe,
+        //         "Connection already closed",
+        //     ));
+        // }
         self.closed = true;
         match self.state {
             State::Estab => {
@@ -279,6 +287,9 @@ impl TCB {
                 debug!("should close from CLOSEWAIT");
                 self.state = State::LastAck;
             }
+            //FIXME: cannot do proper active close in some scenarios if there exist multiple
+            //connections because of
+            //reading_notifier will notify all
             _ => {
                 debug!("close at improper state:{:?}", self.state);
                 unreachable!()
@@ -321,7 +332,7 @@ impl TCB {
             return Ok(Action::Continue);
         }
 
-        // then, we send unsent data if threre is any.
+        // then, we send unsent data if there is any.
         let mut req = None;
         match self.state {
             State::FinWait2 => return Ok(Action::Continue),
@@ -390,10 +401,19 @@ impl TCB {
         tcp_header: etherparse::TcpHeaderSlice,
         data: &[u8],
     ) -> io::Result<Action> {
-        debug!("on segmenting, self state: {:?}", self.state);
-
         let ackn = tcp_header.acknowledgment_number();
         let seqn = tcp_header.sequence_number();
+
+        debug!(
+            "on segmenting, self state: {:?} -> syn: {:?}, fin {:?}, ack: {:?}, rst: {:?}, seqn: {:?}",
+            self.state,
+            tcp_header.syn(),
+            tcp_header.fin(),
+            tcp_header.ack(),
+            tcp_header.rst(),
+            seqn
+        );
+
         match self.state {
             State::Closed => {
                 if !tcp_header.rst() {
@@ -407,9 +427,22 @@ impl TCB {
                     return Ok(Action::Close);
                 }
             }
-            State::SynSent | State::Listen => {
+            State::SynSent => {
                 // we didn't implement active open yet.
                 unimplemented!();
+            }
+            State::Listen => {
+                if tcp_header.ack() {
+                    self.send_rst(nic).unwrap();
+                }
+                if tcp_header.syn() {
+                    let tcb = TCB::new(self.ip_header.clone(), self.tcp_header.clone());
+                    let _o = std::mem::replace(self, tcb);
+                    self.tcp_header.syn = true;
+                    self.tcp_header.ack = true;
+                    self.write(nic, Request::SYNACK).unwrap();
+                }
+                return Ok(Action::Continue);
             }
             State::SynRcvd
             | State::Estab
@@ -423,7 +456,7 @@ impl TCB {
 
                 // first check sequence number
                 if let false = self.check_seq(data, &tcp_header) {
-                    debug!("sequence number invalid");
+                    debug!("seqn: {:?} -> sequence number invalid", seqn);
                     if tcp_header.rst() {
                         return Ok(Action::Close);
                     }
@@ -433,29 +466,26 @@ impl TCB {
 
                 // second check the RST bit
                 if tcp_header.rst() {
-                    // NOTE: operations on passive open are different to active open, here is for
-                    // passive open
-                    debug!("recv RST");
-                    if let State::SynRcvd = self.state {
-                        self.state = State::Listen;
-                        return Ok(Action::Continue);
-                    } else {
-                        self.state = State::Closed;
-                        return Ok(Action::Close);
-                    }
+                    // FIXME: Here we just close this connection when received RST, but RFC 793
+                    // suggests TCP
+                    // should be transfered to proper state.
+                    debug!("seqn: {:?} -> recv RST, enter state::closed", seqn);
+                    self.state = State::Closed;
+                    return Ok(Action::Close);
                 }
 
                 // third check security and precedence, NOT DONE
                 // fourth check the SYN bit
                 if tcp_header.syn() {
-                    debug!("recv dup SYN");
+                    debug!("seqn: {:?} -> recv dup SYN", seqn);
                     self.send_rst(nic).unwrap();
                     self.state = State::Closed;
                     return Ok(Action::Close);
                 };
 
                 debug!(
-                    "Segment is ok for reading. una: {:?}, ackn {:?}, nxt: {:?}, closed?: {:?}",
+                    "Segment: {:?} is ok for reading. una: {:?}, ackn {:?}, nxt: {:?}, closed?: {:?}",
+                    seqn,
                     self.send.una,
                     tcp_header.acknowledgment_number(),
                     self.send.nxt,
@@ -470,10 +500,15 @@ impl TCB {
                     if let State::SynRcvd = self.state {
                         if util::le(self.send.una, ackn) && util::le(ackn, self.send.nxt) {
                             self.state = State::Estab;
-                            // cannot return yet, there may be a FIN
+                            if tcp_header.fin() {
+                                self.closed = true;
+                                self.state = State::LastAck;
+                                self.write(nic, Request::FIN).unwrap();
+                            }
+                            return Ok(Action::Continue);
                         } else {
                             self.send_rst(nic).unwrap();
-                            return Ok(Action::Continue);
+                            return Ok(Action::Close);
                         }
                     }
                     if let State::Estab
@@ -514,10 +549,8 @@ impl TCB {
 
                             self.update_srtt(ackn).unwrap();
 
-                            debug!("ackn: {:?}, timer?: {:?}", ackn, self.timers.send_times);
                             self.send.una = ackn;
                             self.timers.send_times.remove(&self.send.una);
-                            debug!("timer?: {:?}", self.timers.send_times);
 
                             // NOTE: do not return and do not wirte anything right now, because
                             // there may be a FIN.
@@ -534,6 +567,7 @@ impl TCB {
                                 State::Closing => self.state = State::TimeWait,
                                 State::LastAck => {
                                     self.state = State::Closed;
+                                    debug!("seqn: {:?}, got ack for our FIN, now perish", seqn);
                                     return Ok(Action::Close);
                                 }
                                 State::TimeWait => {
@@ -551,9 +585,10 @@ impl TCB {
                     }
                 };
 
+                let mut req: Option<Request> = None;
+                let mut act: Option<Action> = None;
                 // sixth check the URG bit, NOT DONE
                 // seventh, process the segment text
-                let mut req: Option<Request> = None;
                 if let State::Estab | State::FinWait1 | State::FinWait2 = self.state {
                     if !data.is_empty() {
                         // If incoming has no space for this data, an error should return but we
@@ -575,7 +610,14 @@ impl TCB {
                     req = Some(Request::ACK);
 
                     match self.state {
-                        State::SynRcvd | State::Estab => self.state = State::CloseWait,
+                        State::SynRcvd | State::Estab => {
+                            // send [FIN ACK] and send all outgoing
+                            self.closed = true;
+                            self.state = State::LastAck;
+                            req = Some(Request::FIN);
+                            act = Some(Action::Continue);
+                            self.closed_at = Some(self.send.una);
+                        }
                         State::FinWait1 => {
                             if self.closed_at.expect("why closed_at not set?")
                                 == ackn.wrapping_sub(1)
@@ -603,14 +645,17 @@ impl TCB {
                     }
                 }
 
-                debug!("on_segment-> now state: {:?}", self.state);
+                debug!("seqn: {:?} -> now state: {:?}", seqn, self.state);
                 if req.is_some() {
                     self.write(nic, req.unwrap()).unwrap();
+                }
+                if act.is_some() {
+                    return Ok(act.unwrap());
                 }
             }
         }
 
-        Ok(Action::Read)
+        return Ok(Action::Read);
     }
 
     fn check_seq(&mut self, data: &[u8], tcp_header: &etherparse::TcpHeaderSlice) -> bool {

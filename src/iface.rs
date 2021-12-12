@@ -2,7 +2,7 @@ use crate::protocol::Action;
 use crate::protocol::TCB;
 use crate::stream::TcpListener;
 use crate::stream::{Acm, SocketPair};
-use log::{error, info};
+use log::{debug, error, info};
 use nix;
 use std::collections::{hash_map::Entry, VecDeque};
 use std::io;
@@ -101,6 +101,8 @@ fn packet_loop(mut nic: tun_tap::Iface, acm: Acm) -> io::Result<()> {
         }
 
         assert_eq!(n, 1);
+        // FIXME: there must set a block to simutte latency
+        thread::sleep(std::time::Duration::from_millis(2));
 
         let buf_len = nic.recv(&mut buf[..])?;
         // let's ignore non-IP packets
@@ -168,6 +170,7 @@ fn packet_loop(mut nic: tun_tap::Iface, acm: Acm) -> io::Result<()> {
 
                             // Existed connections comes into occupied
                             Entry::Occupied(mut con) => {
+                                debug!("packet arrives");
                                 let data_start = ip_header.ihl() as usize * 4
                                     + tcp_header.slice().len() as usize;
                                 let act = con
@@ -178,6 +181,7 @@ fn packet_loop(mut nic: tun_tap::Iface, acm: Acm) -> io::Result<()> {
                             }
                         };
                         // cm must be dropped before notify_all.
+                        // TODO: delete READ from enum
                         match act {
                             Action::New => {
                                 drop(cm_guard);
@@ -185,9 +189,11 @@ fn packet_loop(mut nic: tun_tap::Iface, acm: Acm) -> io::Result<()> {
                             }
                             Action::Read => {
                                 drop(cm_guard);
-                                acm.reading_notifier.notify_all()
+                                acm.reading_notifier.notify_all();
                             }
-                            Action::Continue => continue,
+                            Action::Continue => {
+                                continue;
+                            }
                             Action::Close => {
                                 cm.connections.remove(&sp);
                             }
