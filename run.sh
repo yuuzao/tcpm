@@ -12,18 +12,7 @@ fi
 echo "cargo done =================="
 
 sudo setcap cap_net_admin=eip $target
-$target &
-
-pid=$!
-echo $pid
-
-sudo ip addr add 192.168.0.1/24 dev $nic
-sudo ip link set up dev $nic 
-
+(sleep 2 && sudo ip addr add 192.168.0.1/24 dev tcpm)&
+(sleep 2 && sudo ip link set up dev tcpm)&
 echo "ip settings done =================="
-
-trap "kill $pid" INT TERM
-wait $pid
-
-
-
+$target 
