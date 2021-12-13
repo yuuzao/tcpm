@@ -1,10 +1,8 @@
 #!/usr/bin/sh
 
 nic="tcpm"
-# target=$PWD/target/release/$nic
-target=$PWD/target/debug/$nic
-# cargo b --release
-cargo b 
+target=$PWD/target/release/$nic
+cargo b --release
 ext=$?
 if [[ $ext -ne 0 ]]; then
 	exit $ext
