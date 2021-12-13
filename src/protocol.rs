@@ -224,6 +224,7 @@ impl TCB {
                 }
             }
         };
+        debug!("tcp::write: payload: {} bytes", payload.len());
 
         let data_size = std::cmp::min(
             buf.len(),
@@ -500,11 +501,13 @@ impl TCB {
                     if let State::SynRcvd = self.state {
                         if util::le(self.send.una, ackn) && util::le(ackn, self.send.nxt) {
                             self.state = State::Estab;
+                            self.send.una = ackn;
                             if tcp_header.fin() {
                                 self.closed = true;
                                 self.state = State::LastAck;
                                 self.write(nic, Request::FIN).unwrap();
                             }
+                            debug!("state from SynRcvd to Estab");
                             return Ok(Action::Continue);
                         } else {
                             self.send_rst(nic).unwrap();
