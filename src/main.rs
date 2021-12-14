@@ -23,7 +23,7 @@ fn main() -> io::Result<()> {
     let mut nic = iface::Interface::new("tcpm")?;
     info!("Main: created interface");
     let mut listener = nic.bind(8010)?;
-    while let Ok(mut stream) = listener.try_new() {
+    while let Ok(mut stream) = listener.accept() {
         let mut s = stream.clone();
         let rx = rx.clone();
         info!("Main: Got connection!");

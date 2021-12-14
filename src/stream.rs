@@ -32,7 +32,7 @@ pub struct TcpListener {
 }
 
 impl TcpListener {
-    pub fn try_new(&mut self) -> io::Result<TcpStream> {
+    pub fn accept(&mut self) -> io::Result<TcpStream> {
         let mut cm = self.m.manager.lock().unwrap();
         loop {
             cm = self.m.estab_notifier.wait(cm).unwrap();
