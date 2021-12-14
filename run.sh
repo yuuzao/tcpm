@@ -14,5 +14,3 @@ sudo setcap cap_net_admin=eip $target
 (sleep 2 && sudo ip link set up dev tcpm)&
 echo "ip settings done =================="
 $target 
-trap "kill $pid" INT TERM
-wait $pid
