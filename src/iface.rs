@@ -65,7 +65,7 @@ impl Interface {
     }
 }
 
-/// This function is initialized by the new() method of Interface. It is a loop
+/// This function is initialized by the accept() method of Interface. It is a loop
 /// for writing and reading.
 /// We use epoll for incoming data, reading will be waked up if the POLLIN fd is
 /// positive. If there's no incoming data, on_tick will be waked up for writing.
@@ -101,7 +101,7 @@ fn packet_loop(mut nic: tun_tap::Iface, acm: Acm) -> io::Result<()> {
         }
 
         assert_eq!(n, 1);
-        // FIXME: there must set a block to simutte latency
+        // FIXME: there must set a block to simulate latency in current implementation
         thread::sleep(std::time::Duration::from_millis(2));
 
         let buf_len = nic.recv(&mut buf[..])?;
