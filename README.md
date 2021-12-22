@@ -62,8 +62,7 @@ c`或者其它键盘信号，不然没法终止程序。
 1. 用`wireshark`来抓包，不过在刚开始的时候不太关心应用层的数据，所以直接用`cli`工具`tshark`来抓包。如果需要解析8进制的ip数据包，使用https://hpd.gasmi.net/
 2. 使用`netcat`作为客户端来测试TCP连接过程。
 3. 由于我们仅仅是为了学习`TCP`协议，并不关心网络数据包的捕获和发送方式，就不用`BPF`或者`DPDK`等工具了。我们使用的是[TUN/TAP](https://zh.wikipedia.org/wiki/TUN%E4%B8%8ETAP)，用它来创建虚拟网卡完成捕获和发送`TCP/IP`数据包，所以我们的项目是用户态`TCP`协议。
-4. 同样，我们也不关心大小端、序列化和反序列化等`TCP/IP`数据包的解析，这个过程使用的是其它`etherparse`这个`Crate`。但是对于`TCP/IP
-ader`的格式还是需要熟悉才行。
+4. 同样，我们也不关心大小端、序列化和反序列化等`TCP/IP`数据包的解析，这个过程使用的是其它`etherparse`这个`Crate`。但是对于`TCP/IP header`的格式还是需要熟悉才行。
 5. 我们使用了`poll`轮询来检查是否有新数据包，所以使用了`nix`这个`crate`。
 6. 使用的一个简单的日志工具`log`和`simplelog`。
 7. 为了实现一个双向通信的应用，需要用到`crossbeam_channel`。
